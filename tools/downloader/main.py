@@ -1,4 +1,5 @@
 import base64
+import subprocess
 import json
 import os
 import platform
@@ -37,6 +38,7 @@ from .model import (
 from .utils import download_file_with_resume
 
 ROOT_PATH = Path(__file__).parent.parent.parent
+LALAMO_PATH = ROOT_PATH / "lalamo"
 CARGO_TOML_PATH = ROOT_PATH / "Cargo.toml"
 TOOLCHAIN_VERSION_PATH = ROOT_PATH / "crates" / "backend-uzu" / "src" / "utils" / "version.rs"
 WORKSPACE_PATH = ROOT_PATH / "workspace"
@@ -146,6 +148,15 @@ def download(
             help=("Hugging Face model repo. Example: [cyan]'meta-llama/Llama-3.2-1B-Instruct'[/cyan]."),
         ),
     ],
+    quantize_embeddings: Annotated[
+        int | None,
+        Option(
+            help=(
+                "When converting via lalamo (repo not in the registry): quantize the tied "
+                "embedding table to this bit width (4 or 8) to cut readout weight traffic."
+            ),
+        ),
+    ] = None,
 ) -> None:
     try:
         with Progress(
@@ -160,7 +171,11 @@ def download(
 
         model = next((m for m in registry.models if model_repo in {m.id, m.repo_id, m.name}), None)
         if not model:
-            err_console.print(f"[red]Error: Model '{model_repo}' not found in registry[/red]")
+            console.print(
+                f"[yellow]Model '{model_repo}' is not in the registry — "
+                "converting from Hugging Face via the vendored lalamo...[/yellow]"
+            )
+            convert_via_lalamo(model_repo, quantize_embeddings)
             return
 
         engine_version = get_uzu_version()
@@ -223,7 +238,49 @@ def download(
         err_console.print(f"[red]Error: {error}[/red]")
 
 
+def convert_via_lalamo(model_repo: str, quantize_embeddings: int | None) -> None:
+    """Converts a Hugging Face repo into the uzu format with the vendored
+    lalamo and drops it into the versioned models directory, complete with
+    the benchmark task the registry path would have written. The engine
+    infers encoding.json from the recorded repo_id on first launch."""
+    if not LALAMO_PATH.exists():
+        raise ValueError(f"vendored lalamo not found at {LALAMO_PATH}")
+
+    engine_version = get_uzu_version()
+    model_name = model_repo.rstrip("/").split("/")[-1]
+    model_path = MODELS_PATH / engine_version / model_name
+
+    command = [
+        "uv",
+        "run",
+        "--project",
+        str(LALAMO_PATH),
+        "lalamo",
+        "convert",
+        model_repo,
+        "--output-dir",
+        str(model_path),
+        "--overwrite",
+    ]
+    if quantize_embeddings is not None:
+        command += ["--quantize-embeddings", str(quantize_embeddings)]
+
+    console.print(f"Running: [cyan]{' '.join(command)}[/cyan]")
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        raise ValueError(f"lalamo convert failed with exit code {result.returncode}")
+
+    benchmark_task = build_benchmark_task(model_name.lower(), model_repo)
+    with open(model_path / "benchmark_task.json", "w") as file:
+        json.dump(asdict(benchmark_task), file, indent=4, sort_keys=True)
+    console.print(f"[green]Successfully converted model: {model_name}[/green]")
+
+
 def generate_benchmark_task(model: Model) -> BenchmarkTask:
+    return build_benchmark_task(model.name.lower(), model.repo_id)
+
+
+def build_benchmark_task(identifier: str, repo_id: str) -> BenchmarkTask:
     messages: list[Message] = [
         Message(role=Role.SYSTEM, content="Summarize user's input"),
         Message(
@@ -233,8 +290,8 @@ def generate_benchmark_task(model: Model) -> BenchmarkTask:
     ]
 
     return BenchmarkTask(
-        identifier=model.name.lower(),
-        repo_id=model.repo_id,
+        identifier=identifier,
+        repo_id=repo_id,
         number_of_runs=15,
         tokens_limit=512,
         messages=messages,

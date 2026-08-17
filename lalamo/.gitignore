@@ -1,0 +1,69 @@
+.DS_Store
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Ruff
+.ruff_cache/
+
+# Virtual environments
+.venv
+
+# Pyright
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+.pyright/
+
+# Notebooks
+/notebooks/
+
+# Downloads
+/downloads/
+
+# Converted models
+/models/
+
+# Inference traces
+/traces/
+
+# IDE
+.idea/
+*~
+\#*\#
+.\#*
+
+sync.bb
+.clj-kondo
+.lsp
+
+# Profiler
+memray-*.bin
+memray-*.html
+*.prof
+profile-data/
+
+# temporary data
+tmp/
+_tmp
+
+# parquet (dataset) files in the root
+*parquet
+
+.envrc
+
+# Git worktrees
+.worktrees/
+
+# jax cache
+.jax_cache/
+
+# preserve github folder
+!.github
+
+.env

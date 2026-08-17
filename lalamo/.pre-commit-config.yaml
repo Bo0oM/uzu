@@ -1,0 +1,44 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-toml
+      - id: check-yaml
+      - id: check-added-large-files
+        args: [--maxkb=10240]
+        exclude: '\.(parquet|safetensors)$'
+      - id: no-commit-to-branch
+        args: [--branch, main, --branch, master]
+
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.43.3
+    hooks:
+      - id: typos
+        exclude: '^(tests.*|uv\.lock|.*\.parquet|.*\.safetensors)$'
+        args: []
+
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.10.0
+    hooks:
+      - id: uv-lock
+
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        language: system
+        entry: ruff check --fix .
+        pass_filenames: false
+      - id: ruff-format
+        name: ruff format
+        language: system
+        entry: ruff format .
+        pass_filenames: false
+      - id: pyrefly-check
+        name: pyrefly check
+        language: system
+        entry: pyrefly check
+        pass_filenames: false

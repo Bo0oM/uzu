@@ -1,0 +1,871 @@
+from dataclasses import dataclass
+
+from jax import numpy as jnp
+from jaxtyping import Array, Float, Int
+
+from lalamo.initializer import Initializer
+from lalamo.module import Keychain, LalamoConfig, LalamoModule, LogicalAxis
+from lalamo.modules.activations import Activation
+from lalamo.modules.audio.common_modules import (
+    CausalConv1d,
+    CausalConv1dConfig,
+    CausalTransposeConv1d,
+    CausalTransposeConv1dConfig,
+    Snake1d,
+    Snake1dConfig,
+)
+from lalamo.modules.embedding import EmbeddingForwardPassConfig, TiedEmbedding, TiedEmbeddingConfig
+from lalamo.modules.linear import Linear, LinearConfig
+from lalamo.modules.normalization import Normalization, NormalizationConfig
+from lalamo.modules.transformer import Transformer, TransformerConfig, TransformerForwardPassConfig
+from lalamo.modules.utils import call_vmapped, call_vmapped_twice
+from lalamo.utils.sharding import with_sharding
+
+
+@dataclass(frozen=True)
+class ConvNeXtSpatialParams:
+    """Spatial parameters for ConvNeXt blocks.
+
+    These parameters control the spatial convolution and MLP expansion in ConvNeXt blocks.
+    """
+
+    # NOTE: default values are taken from the code and they do not seem to be present in
+    # the config at all
+    layer_scale_init_value: float = 1e-6
+    mlp_ratio: float = 4.0
+    kernel_size: int = 7
+    dilation: int = 1
+
+
+@dataclass(frozen=True)
+class ConvNeXtBlockConfig(LalamoConfig):
+    activation: Activation
+    dwconv_config: CausalConv1dConfig
+    norm_config: NormalizationConfig
+    pwconv_config: LinearConfig
+
+    def init(
+        self,
+        initializer: Initializer,
+        dim: int,
+        spatial_params: ConvNeXtSpatialParams,
+    ) -> "ConvNeXtBlock":
+        dwconv = self.dwconv_config.init(
+            initializer,
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=spatial_params.kernel_size,
+            stride=1,
+            dilation=spatial_params.dilation,
+            groups=dim,
+        )
+
+        norm = self.norm_config.init(initializer, dim)
+
+        hidden_dim = int(spatial_params.mlp_ratio * dim)
+        pwconv1 = self.pwconv_config.init(initializer, input_dim=dim, output_dims=(hidden_dim,), has_biases=True)
+        pwconv2 = self.pwconv_config.init(initializer, input_dim=hidden_dim, output_dims=(dim,), has_biases=True)
+
+        return ConvNeXtBlock(
+            config=self,
+            sharding_config=initializer.sharding_config,
+            depthwise_conv=dwconv,
+            norm=norm,
+            pointwise_conv_step1=pwconv1,
+            pointwise_conv_step2=pwconv2,
+        )
+
+
+class ConvNeXtBlock(LalamoModule[ConvNeXtBlockConfig]):
+    """ConvNeXt block implementation.
+
+    Architecture:
+    1. DwConv (depthwise causal conv)
+    2. LayerNorm
+    3. Pointwise conv 1 (expand)
+    4. GELU
+    5. Pointwise conv 2 (project)
+    6. Layer scale (gamma)
+    7. Residual connection
+
+    Input format: (batch, sequence, channels) - NSC format (JAX convention)
+    Output format: (batch, sequence, channels) - NSC format (JAX convention)
+    """
+
+    depthwise_conv: CausalConv1d
+    norm: Normalization
+    pointwise_conv_step1: Linear
+    pointwise_conv_step2: Linear
+
+    @property
+    def dim(self) -> int:
+        return self.depthwise_conv.out_channels
+
+    def __call__(
+        self,
+        x: Float[Array, "batch sequence channels"],
+        apply_residual: bool = True,
+        *,
+        keychain: Keychain,
+    ) -> Float[Array, "batch sequence channels"]:
+        residual = x
+
+        step1_keychain, step2_keychain = keychain.split()
+        x = self.depthwise_conv(x)
+        x = call_vmapped_twice(self.norm, x)
+        (x,) = call_vmapped_twice(
+            self.pointwise_conv_step1,
+            x,
+            keychain=step1_keychain,
+            added_sharding_axes=(
+                self.sharding_config.resolve_axis(LogicalAxis.BATCH),
+                self.sharding_config.resolve_axis(LogicalAxis.SEQUENCE),
+            ),
+        )
+        x = call_vmapped_twice(self.config.activation, x)
+        (x,) = call_vmapped_twice(
+            self.pointwise_conv_step2,
+            x,
+            keychain=step2_keychain,
+            added_sharding_axes=(
+                self.sharding_config.resolve_axis(LogicalAxis.BATCH),
+                self.sharding_config.resolve_axis(LogicalAxis.SEQUENCE),
+            ),
+        )
+        if apply_residual:
+            x = residual + x
+
+        return x
+
+
+@dataclass(frozen=True)
+class TransposeConvSpatialParams:
+    in_channels: int
+    out_channels: int
+    upsample_kernel_size: int
+    upsample_stride: int
+
+
+@dataclass(frozen=True)
+class UpsamplingBlockConfig(LalamoConfig):
+    trans_conv_config: CausalTransposeConv1dConfig
+    convnext_config: ConvNeXtBlockConfig
+
+    def init(
+        self,
+        initializer: Initializer,
+        trans_conv_params: TransposeConvSpatialParams,
+        convnext_spatial_params: ConvNeXtSpatialParams,
+    ) -> "UpsamplingBlock":
+        trans_conv = self.trans_conv_config.init(
+            initializer,
+            in_channels=trans_conv_params.in_channels,
+            out_channels=trans_conv_params.out_channels,
+            kernel_size=trans_conv_params.upsample_kernel_size,
+            stride=trans_conv_params.upsample_stride,
+        )
+
+        convnext = self.convnext_config.init(
+            initializer,
+            dim=trans_conv_params.out_channels,
+            spatial_params=convnext_spatial_params,
+        )
+
+        return UpsamplingBlock(
+            config=self,
+            sharding_config=initializer.sharding_config,
+            trans_conv=trans_conv,
+            convnext=convnext,
+        )
+
+
+class UpsamplingBlock(LalamoModule[UpsamplingBlockConfig]):
+    """Upsampling block consisting of transposed convolution followed by ConvNeXt block.
+
+    Architecture:
+    1. CausalTransposeConv1d (upsample)
+    2. ConvNeXtBlock (refine)
+
+    Input format: (batch, sequence, channels) - NSC format (JAX convention)
+    Output format: (batch, sequence_upsampled, channels) - NSC format (JAX convention)
+    """
+
+    trans_conv: CausalTransposeConv1d
+    convnext: ConvNeXtBlock
+
+    @property
+    def in_channels(self) -> int:
+        return self.trans_conv.in_channels
+
+    @property
+    def out_channels(self) -> int:
+        return self.trans_conv.out_channels
+
+    def __call__(
+        self,
+        x: Float[Array, "batch sequence in_channels"],
+        *,
+        keychain: Keychain,
+    ) -> Float[Array, "batch sequence_out out_channels"]:
+        x = self.trans_conv(x)
+        return self.convnext(x, keychain=keychain)
+
+
+@dataclass(frozen=True)
+class UpsamplerConfig(LalamoConfig):
+    block_configs: tuple[UpsamplingBlockConfig, ...]
+
+    def init(
+        self,
+        initializer: Initializer,
+        trans_conv_params_per_block: tuple[TransposeConvSpatialParams, ...],
+        convnext_spatial_params: ConvNeXtSpatialParams,
+    ) -> "Upsampler":
+        assert len(self.block_configs) == len(trans_conv_params_per_block), (
+            f"Number of block configs ({len(self.block_configs)}) must match "
+            f"number of block params ({len(trans_conv_params_per_block)})"
+        )
+
+        blocks = [
+            config.init(
+                initializer,
+                trans_conv_params=trans_conv_params,
+                convnext_spatial_params=convnext_spatial_params,
+            )
+            for config, trans_conv_params in zip(self.block_configs, trans_conv_params_per_block, strict=True)
+        ]
+
+        return Upsampler(
+            config=self,
+            sharding_config=initializer.sharding_config,
+            blocks=tuple(blocks),
+        )
+
+
+class Upsampler(LalamoModule[UpsamplerConfig]):
+    """Full upsampler module consisting of multiple UpsamplingBlocks.
+
+    This module sequentially applies a series of upsampling blocks to progressively
+    increase the temporal resolution of the input while transforming channel dimensions.
+
+    Input format: (batch, sequence, channels) - NSC format (JAX convention)
+    Output format: (batch, sequence_upsampled, channels) - NSC format (JAX convention)
+    """
+
+    blocks: tuple[UpsamplingBlock, ...]
+
+    @property
+    def num_blocks(self) -> int:
+        return len(self.blocks)
+
+    def __call__(
+        self,
+        x: Float[Array, "batch sequence in_channels"],
+        *,
+        keychain: Keychain,
+    ) -> Float[Array, "batch sequence_out out_channels"]:
+        for block, block_keychain in zip(self.blocks, keychain.split(len(self.blocks)), strict=True):
+            x = block(x, keychain=block_keychain)
+        return x
+
+
+@dataclass(frozen=True)
+class VectorQuantizeConfig(LalamoConfig):
+    codebook_config: TiedEmbeddingConfig
+    out_proj_config: LinearConfig
+
+    def init(
+        self,
+        initializer: Initializer,
+        input_dim: int,
+        codebook_size: int,
+        codebook_dim: int,
+    ) -> "VectorQuantize":
+        codebook = self.codebook_config.init(
+            initializer,
+            model_dim=codebook_dim,
+            vocab_size=codebook_size,
+        )
+        assert isinstance(codebook, TiedEmbedding)
+
+        out_proj = self.out_proj_config.init(
+            initializer, input_dim=codebook_dim, output_dims=(input_dim,), has_biases=True
+        )
+        assert isinstance(out_proj, Linear)
+
+        return VectorQuantize(
+            config=self,
+            sharding_config=initializer.sharding_config,
+            codebook=codebook,
+            out_proj=out_proj,
+        )
+
+
+class VectorQuantize(LalamoModule[VectorQuantizeConfig]):
+    """Vector Quantization module (decoding path only).
+
+    Decodes codebook indices back to input space by:
+    1. Looking up codebook vectors
+    2. Projecting from codebook_dim to input_dim via out_proj
+    """
+
+    codebook: TiedEmbedding
+    out_proj: Linear
+
+    @property
+    def codebook_size(self) -> int:
+        return self.codebook.vocab_size
+
+    @property
+    def codebook_dim(self) -> int:
+        return self.codebook.model_dim
+
+    def decode_code(
+        self,
+        embed_id: Int[Array, " tokens"],
+        *,
+        keychain: Keychain,
+    ) -> Float[Array, "tokens channels"]:
+        embed_keychain, out_keychain = keychain.split()
+        z_p = self.codebook.embed(
+            embed_id,
+            forward_pass_config=EmbeddingForwardPassConfig(activation_dtype=self.codebook.embedding.dtype),
+            keychain=embed_keychain,
+        )
+        (z_q,) = call_vmapped(
+            self.out_proj,
+            z_p,
+            keychain=out_keychain,
+        )
+        return z_q
+
+
+@dataclass(frozen=True)
+class VectorQuantizerParams:
+    input_dim: int
+    codebook_size: int
+    codebook_dim: int | list[int]
+
+
+@dataclass(frozen=True)
+class ResidualVectorQuantizeConfig(LalamoConfig):
+    vq_config: VectorQuantizeConfig
+
+    def init(
+        self,
+        initializer: Initializer,
+        input_dim: int,
+        codebook_size: int,
+        codebook_dim: int | list[int],
+    ) -> "ResidualVectorQuantize":
+        if isinstance(codebook_dim, int):
+            codebook_dims = [codebook_dim]
+        else:
+            codebook_dims = list(codebook_dim)
+
+        quantizers = [
+            self.vq_config.init(
+                initializer,
+                input_dim=input_dim,
+                codebook_size=codebook_size,
+                codebook_dim=dim,
+            )
+            for dim in codebook_dims
+        ]
+
+        return ResidualVectorQuantize(
+            config=self,
+            sharding_config=initializer.sharding_config,
+            quantizers=tuple(quantizers),
+        )
+
+
+class ResidualVectorQuantize(LalamoModule[ResidualVectorQuantizeConfig]):
+    """Residual Vector Quantization module (decoding path only).
+    Decodes codes from multiple codebooks by summing their decoded outputs.
+    """
+
+    quantizers: tuple[VectorQuantize, ...]
+
+    @property
+    def n_codebooks(self) -> int:
+        return len(self.quantizers)
+
+    def from_codes(
+        self,
+        codes: Int[Array, "n_codebooks tokens"],
+        *,
+        keychain: Keychain,
+    ) -> Float[Array, "tokens channels"]:
+        num_input_codebooks, _ = codes.shape
+        selected_quantizers = self.quantizers[:num_input_codebooks]
+        first_quantizer, *remaining_quantizers = selected_quantizers
+        first_codes, *remaining_codes = codes
+        first_quantizer_keychain, *remaining_quantizer_keychains = keychain.split(num_input_codebooks)
+        z_q = first_quantizer.decode_code(
+            first_codes,
+            keychain=first_quantizer_keychain,
+        )
+        for quantizer, quantizer_codes, quantizer_keychain in zip(
+            remaining_quantizers,
+            remaining_codes,
+            remaining_quantizer_keychains,
+            strict=True,
+        ):
+            z_q = z_q + quantizer.decode_code(
+                quantizer_codes,
+                keychain=quantizer_keychain,
+            )
+        return z_q
+
+    def __call__(
+        self,
+        codes: Int[Array, "batch n_codebooks tokens"],
+        *,
+        keychain: Keychain,
+    ) -> Float[Array, "batch tokens channels"]:
+        return call_vmapped(self.from_codes, codes, keychain=keychain)
+
+
+@dataclass(frozen=True)
+class DownsampleResidualVectorQuantizeConfig(LalamoConfig):
+    semantic_quantizer_config: ResidualVectorQuantizeConfig
+    quantizer_config: ResidualVectorQuantizeConfig
+    post_module_config: TransformerConfig
+    upsampler_config: UpsamplerConfig
+
+    def init(
+        self,
+        initializer: Initializer,
+        upsampler_trans_conv_params: tuple[TransposeConvSpatialParams, ...],
+        convnext_spatial_params: ConvNeXtSpatialParams,
+        semantic_quantizer_params: VectorQuantizerParams,
+        quantizer_params: VectorQuantizerParams,
+    ) -> "DownsampleResidualVectorQuantize":
+        semantic_quantizer = self.semantic_quantizer_config.init(
+            initializer,
+            input_dim=semantic_quantizer_params.input_dim,
+            codebook_size=semantic_quantizer_params.codebook_size,
+            codebook_dim=semantic_quantizer_params.codebook_dim,
+        )
+        quantizer = self.quantizer_config.init(
+            initializer,
+            input_dim=quantizer_params.input_dim,
+            codebook_size=quantizer_params.codebook_size,
+            codebook_dim=quantizer_params.codebook_dim,
+        )
+        post_module = self.post_module_config.init(initializer)
+        upsampler = self.upsampler_config.init(
+            initializer,
+            trans_conv_params_per_block=upsampler_trans_conv_params,
+            convnext_spatial_params=convnext_spatial_params,
+        )
+
+        return DownsampleResidualVectorQuantize(
+            config=self,
+            sharding_config=initializer.sharding_config,
+            semantic_quantizer=semantic_quantizer,
+            quantizer=quantizer,
+            post_module=post_module,
+            upsampler=upsampler,
+        )
+
+
+class DownsampleResidualVectorQuantize(LalamoModule[DownsampleResidualVectorQuantizeConfig]):
+    """Downsampled Residual Vector Quantization decoder module.
+
+    This module decodes audio codes by:
+    1. Decoding semantic codes through the semantic quantizer
+    2. Decoding residual codes through the residual quantizer
+    3. Summing the semantic and residual representations
+    4. Processing through a transformer post-module
+    5. Upsampling to the target temporal resolution
+
+    Input: Integer codes with shape (batch, n_codebooks, tokens)
+           where the first codebook row contains semantic codes
+           and remaining rows contain residual codes.
+    Output: Continuous audio features with shape (batch, upsampled_tokens, channels)
+    """
+
+    semantic_quantizer: ResidualVectorQuantize
+    quantizer: ResidualVectorQuantize
+    post_module: Transformer
+    upsampler: Upsampler
+
+    @property
+    def semantic_codebook_size(self) -> int:
+        return self.semantic_quantizer.quantizers[0].codebook_size
+
+    @property
+    def quantizer_codebook_size(self) -> int:
+        return self.quantizer.quantizers[0].codebook_size
+
+    def decode(
+        self,
+        indices: Int[Array, "batch n_codebooks tokens"],
+        *,
+        keychain: Keychain,
+    ) -> Float[Array, "batch upsampled_tokens channels"]:
+        semantic_keychain, residual_keychain, post_keychain, upsampler_keychain = keychain.split(4)
+        semantic_indices = jnp.clip(indices[:, :1], 0, self.semantic_codebook_size - 1)
+        residual_indices = jnp.clip(indices[:, 1:], 0, self.quantizer_codebook_size - 1)
+
+        z_q_semantic = call_vmapped(
+            self.semantic_quantizer.from_codes,
+            semantic_indices,
+            keychain=semantic_keychain,
+            added_sharding_axis=self.sharding_config.resolve_axis(LogicalAxis.BATCH),
+        )
+        z_q_residual = call_vmapped(
+            self.quantizer.from_codes,
+            residual_indices,
+            keychain=residual_keychain,
+            added_sharding_axis=self.sharding_config.resolve_axis(LogicalAxis.BATCH),
+        )
+
+        z_q = z_q_semantic + z_q_residual
+
+        batch_size, seq_length, _ = z_q.shape
+        token_positions = jnp.broadcast_to(jnp.arange(seq_length)[None, :], (batch_size, seq_length))
+        token_positions = with_sharding(
+            token_positions,
+            self.sharding_config.resolve_sharding((LogicalAxis.BATCH, None)),
+        )
+
+        post_result = self.post_module(
+            inner_features=z_q,
+            token_positions=token_positions,
+            state=None,
+            return_updated_state=False,
+            return_layer_results=False,
+            return_positional_embeddings=False,
+            lengths_without_padding=None,
+            forward_pass_config=TransformerForwardPassConfig(),
+            keychain=post_keychain,
+        )
+        z_q = post_result.outputs
+        return self.upsampler(z_q, keychain=upsampler_keychain)
+
+    def __call__(
+        self,
+        indices: Int[Array, "batch n_codebooks tokens"],
+        *,
+        keychain: Keychain,
+    ) -> Float[Array, "batch upsampled_tokens channels"]:
+        return self.decode(indices, keychain=keychain)
+
+
+@dataclass(frozen=True)
+class ResidualUnitSpatialParams:
+    dilation: int = 1
+    kernel_size: int = 7
+
+
+@dataclass(frozen=True)
+class ResidualUnitConfig(LalamoConfig):
+    snake_config: Snake1dConfig
+    conv_config: CausalConv1dConfig
+    causal: bool = True
+
+    def init(
+        self,
+        initializer: Initializer,
+        dim: int,
+        spatial_params: ResidualUnitSpatialParams,
+    ) -> "ResidualUnit":
+        if not self.causal:
+            raise NotImplementedError("Non-causal ResidualUnit is not implemented")
+
+        snake1 = self.snake_config.init(initializer, dim)
+
+        conv1 = self.conv_config.init(
+            initializer,
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=spatial_params.kernel_size,
+            stride=1,
+            dilation=spatial_params.dilation,
+            groups=1,
+        )
+
+        snake2 = self.snake_config.init(initializer, dim)
+
+        conv2 = self.conv_config.init(
+            initializer,
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=1,
+            stride=1,
+            dilation=1,
+            groups=1,
+        )
+
+        return ResidualUnit(
+            config=self,
+            sharding_config=initializer.sharding_config,
+            snake1=snake1,
+            conv1=conv1,
+            snake2=snake2,
+            conv2=conv2,
+        )
+
+
+class ResidualUnit(LalamoModule[ResidualUnitConfig]):
+    """ResidualUnit module.
+
+    Architecture:
+    1. Snake1d activation
+    2. Conv1d (kernel_size=7, with dilation)
+    3. Snake1d activation
+    4. Conv1d (kernel_size=1)
+    5. Residual connection
+
+    Input format: (batch, sequence, channels) - NSC format (JAX convention)
+    Output format: (batch, sequence, channels) - NSC format (JAX convention)
+    """
+
+    snake1: Snake1d
+    conv1: CausalConv1d
+    snake2: Snake1d
+    conv2: CausalConv1d
+
+    @property
+    def dim(self) -> int:
+        return self.snake1.channels
+
+    def __call__(
+        self,
+        x: Float[Array, "batch sequence channels"],
+    ) -> Float[Array, "batch sequence channels"]:
+        """Apply ResidualUnit.
+
+        Args:
+            x: Input tensor of shape (batch, sequence, channels)
+
+        Returns:
+            Output tensor of shape (batch, sequence, channels)
+        """
+        # Forward through the block
+        y = self.snake1(x)
+        y = self.conv1(y)
+        y = self.snake2(y)
+        y = self.conv2(y)
+
+        # Handle padding difference for residual connection
+        # In causal mode, output may be shorter than input due to causal padding
+        pad = x.shape[1] - y.shape[1]
+        if pad > 0:
+            # For causal: trim from the end of x
+            x = x[:, :-pad, :]
+
+        return x + y
+
+
+@dataclass(frozen=True)
+class AudioDecoderBlockSpatialParams:
+    input_dim: int
+    output_dim: int
+    stride: int
+
+
+@dataclass(frozen=True)
+class DACDecoderBlockConfig(LalamoConfig):
+    snake_config: Snake1dConfig
+    trans_conv_config: CausalTransposeConv1dConfig
+    res_unit_config: ResidualUnitConfig
+    causal: bool = True
+
+    def init(
+        self,
+        initializer: Initializer,
+        spatial_params: AudioDecoderBlockSpatialParams,
+    ) -> "DACDecoderBlock":
+        input_dim = spatial_params.input_dim
+        output_dim = spatial_params.output_dim
+        stride = spatial_params.stride
+
+        snake = self.snake_config.init(initializer, input_dim)
+
+        trans_conv = self.trans_conv_config.init(
+            initializer,
+            in_channels=input_dim,
+            out_channels=output_dim,
+            kernel_size=2 * stride,
+            stride=stride,
+        )
+
+        res_unit1 = self.res_unit_config.init(initializer, output_dim, ResidualUnitSpatialParams(dilation=1))
+        res_unit2 = self.res_unit_config.init(initializer, output_dim, ResidualUnitSpatialParams(dilation=3))
+        res_unit3 = self.res_unit_config.init(initializer, output_dim, ResidualUnitSpatialParams(dilation=9))
+
+        return DACDecoderBlock(
+            config=self,
+            sharding_config=initializer.sharding_config,
+            snake=snake,
+            trans_conv=trans_conv,
+            res_unit1=res_unit1,
+            res_unit2=res_unit2,
+            res_unit3=res_unit3,
+        )
+
+
+class DACDecoderBlock(LalamoModule[DACDecoderBlockConfig]):
+    """DACDecoderBlock module for audio decoding.
+
+    Architecture:
+    1. Snake1d activation
+    2. CausalTransposeConv1d (upsample)
+    3. ResidualUnit (dilation=1)
+    4. ResidualUnit (dilation=3)
+    5. ResidualUnit (dilation=9)
+
+    Input format: (batch, sequence, channels) - NSC format (JAX convention)
+    Output format: (batch, sequence_upsampled, channels) - NSC format (JAX convention)
+    """
+
+    snake: Snake1d
+    trans_conv: CausalTransposeConv1d
+    res_unit1: ResidualUnit
+    res_unit2: ResidualUnit
+    res_unit3: ResidualUnit
+
+    @property
+    def input_dim(self) -> int:
+        return self.snake.channels
+
+    @property
+    def output_dim(self) -> int:
+        return self.trans_conv.out_channels
+
+    def __call__(
+        self,
+        x: Float[Array, "batch sequence in_channels"],
+    ) -> Float[Array, "batch sequence_out out_channels"]:
+        x = self.snake(x)
+        x = self.trans_conv(x)
+        x = self.res_unit1(x)
+        x = self.res_unit2(x)
+        return self.res_unit3(x)
+
+
+@dataclass(frozen=True)
+class DACDecoderSpatialParams:
+    input_channel: int  # Input channels (from quantizer output)
+    channels: int  # Initial channel width after first conv
+    rates: tuple[int, ...]  # Upsampling rates for each DecoderBlock
+    d_out: int = 1  # Output channels (1 for mono audio)
+
+
+@dataclass(frozen=True)
+class DACDecoderConfig(LalamoConfig):
+    conv_config: CausalConv1dConfig
+    snake_config: Snake1dConfig
+    decoder_block_config: DACDecoderBlockConfig
+    causal: bool = True
+
+    def init(
+        self,
+        initializer: Initializer,
+        spatial_params: DACDecoderSpatialParams,
+    ) -> "DACDecoder":
+        if not self.causal:
+            raise NotImplementedError("Non-causal AudioDecoder is not implemented")
+
+        input_channel = spatial_params.input_channel
+        channels = spatial_params.channels
+        rates = spatial_params.rates
+        d_out = spatial_params.d_out
+
+        first_conv = self.conv_config.init(
+            initializer,
+            in_channels=input_channel,
+            out_channels=channels,
+            kernel_size=7,
+            stride=1,
+            dilation=1,
+            groups=1,
+        )
+
+        decoder_blocks: list[DACDecoderBlock] = []
+        for i, stride in enumerate(rates):
+            block_input_dim = channels // (2**i)
+            block_output_dim = channels // (2 ** (i + 1))
+
+            block_spatial = AudioDecoderBlockSpatialParams(
+                input_dim=block_input_dim,
+                output_dim=block_output_dim,
+                stride=stride,
+            )
+            block = self.decoder_block_config.init(initializer, spatial_params=block_spatial)
+            decoder_blocks.append(block)
+
+        # Final output dimension after all decoder blocks
+        final_dim = channels // (2 ** len(rates))
+
+        final_snake = self.snake_config.init(initializer, final_dim)
+
+        final_conv = self.conv_config.init(
+            initializer,
+            in_channels=final_dim,
+            out_channels=d_out,
+            kernel_size=7,
+            stride=1,
+            dilation=1,
+            groups=1,
+        )
+
+        return DACDecoder(
+            config=self,
+            sharding_config=initializer.sharding_config,
+            first_conv=first_conv,
+            decoder_blocks=tuple(decoder_blocks),
+            final_snake=final_snake,
+            final_conv=final_conv,
+        )
+
+
+class DACDecoder(LalamoModule[DACDecoderConfig]):
+    """Decoder module used in DAC for decoding audio from latent representations.
+
+    Architecture:
+    1. CausalConv1d (input_channel -> channels)
+    2. Multiple DecoderBlocks (upsampling with residual refinement)
+    3. Snake1d activation
+    4. CausalConv1d (final_dim -> d_out)
+    5. Tanh activation
+
+    Input format: (batch, sequence, channels) - NSC format (JAX convention)
+    Output format: (batch, sequence_upsampled, d_out) - NSC format (JAX convention)
+    """
+
+    first_conv: CausalConv1d
+    decoder_blocks: tuple[DACDecoderBlock, ...]
+    final_snake: Snake1d
+    final_conv: CausalConv1d
+
+    @property
+    def input_channels(self) -> int:
+        return self.first_conv.in_channels
+
+    @property
+    def output_channels(self) -> int:
+        return self.final_conv.out_channels
+
+    @property
+    def num_blocks(self) -> int:
+        return len(self.decoder_blocks)
+
+    def __call__(
+        self,
+        x: Float[Array, "batch sequence in_channels"],
+    ) -> Float[Array, "batch sequence_out out_channels"]:
+        x = self.first_conv(x)
+
+        for block in self.decoder_blocks:
+            x = block(x)
+
+        x = self.final_snake(x)
+        x = self.final_conv(x)
+
+        # Tanh to constrain output to [-1, 1]
+        return jnp.tanh(x)

@@ -1,0 +1,23 @@
+from jaxtyping import Array, Float
+
+from lalamo.weight_matrix import FullPrecisionMatrix, FullPrecisionSpec, ShapeDtypeMatrix, WeightMatrix
+
+__all__ = [
+    "load_full_precision",
+]
+
+
+def load_full_precision(
+    template: WeightMatrix,
+    weights: Float[Array, "*components out_channels in_channels"],
+) -> FullPrecisionMatrix:
+    if not isinstance(template, ShapeDtypeMatrix):
+        raise TypeError(f"Expected ShapeDtypeMatrix, got {type(template).__name__}.")
+    dtype = template.dtype
+    if template.dummy_weights.weak_type:
+        dtype = weights.dtype
+    return FullPrecisionSpec(layout=template.spec.layout).compress(
+        weights.astype(dtype),
+        sharding_config=template.sharding_config,
+        is_sharded=template.is_sharded,
+    )

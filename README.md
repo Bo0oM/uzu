@@ -73,6 +73,8 @@ Prompt-lookup speculation on the existing tree-verification infrastructure: draf
 
 ### Model tooling
 
+- **Vendored lalamo fork** (`lalamo/`, pinned to the 0.5.16 model-format schema) with a new `--quantize-embeddings {4,8}` conversion flag: quantizes the tied embedding table only (it doubles as the vocabulary readout and accounts for 20–32% of per-token weight traffic on bf16 exports). Measured: Qwen3-0.6B +8.6%, LFM2-350M +7.0% decode at ~2·10⁻³ maximum absolute quantization error.
+- **Downloader auto-conversion.** `tools/downloader` falls back to the vendored lalamo for Hugging Face repositories that are not in the cloud registry: download, convert, and register in one command.
 - **encoding.json inference.** The engine's local model registries infer the chat-template configuration from the recorded repository id or the model directory name when `encoding.json` is missing (side-loaded and freshly converted models previously failed to start chat), and persist it next to the weights.
 
 ### Bug fixes
