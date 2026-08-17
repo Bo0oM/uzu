@@ -20,6 +20,9 @@ pub fn weaver_top_children(
     expand_width: u32,
     vocab_size: u32,
 ) {
+    // Kept for kernel-signature parity with Metal; the gumbel mapping no
+    // longer depends on the vocab size.
+    let _ = vocab_size;
     let rows = rows as usize;
     let candidates = candidates as usize;
     let expand_width = expand_width as usize;
@@ -36,9 +39,8 @@ pub fn weaver_top_children(
             .collect::<Vec<_>>();
         let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let log_sum = logits.iter().map(|value| (value - max).exp()).sum::<f32>().ln() + max;
-        let perturbed = (0..candidates)
-            .map(|index| logits[index] + gumbel_float(seed, revidx(token(index), vocab_size)))
-            .collect::<Vec<_>>();
+        let perturbed =
+            (0..candidates).map(|index| logits[index] + gumbel_float(seed, revidx(token(index)))).collect::<Vec<_>>();
         let mut indices = (0..candidates).collect::<Vec<_>>();
         indices.sort_by(|&left, &right| {
             perturbed[right].total_cmp(&perturbed[left]).then_with(|| token(left).cmp(&token(right)))

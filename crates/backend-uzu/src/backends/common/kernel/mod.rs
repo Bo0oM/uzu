@@ -6,8 +6,10 @@ pub mod delta_net_chunked_prefill;
 pub mod delta_net_tree_verify;
 pub mod matmul;
 pub mod radix_top_k_small;
+pub mod unified_sampling;
 
 pub use activation_transform::ActivationTransform;
+pub use unified_sampling::UnifiedSamplingKernel;
 
 include!(concat!(env!("OUT_DIR"), "/traits.rs"));
 
@@ -20,6 +22,7 @@ pub trait Kernels: Sized {
     type DeltaNetTreeVerify: delta_net_tree_verify::DeltaNetTreeVerify<Self::Backend>;
     type MatmulKernel: matmul::MatmulKernel<Backend = Self::Backend>;
     type RadixTopKSmall: radix_top_k_small::RadixTopKSmall<Self::Backend>;
+    type UnifiedSamplingKernel: unified_sampling::UnifiedSamplingKernel<Backend = Self::Backend>;
 }
 
 #[cfg(test)]

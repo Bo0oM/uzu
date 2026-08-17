@@ -101,8 +101,13 @@ fn ancestor_attention<const HEAD_DIM: u32>(
             );
             attention_single_pass::<bf16, HEAD_DIM>(
                 rotated_queries.as_ptr(),
-                keys.as_ptr(),
-                values.as_ptr(),
+                Some(keys.as_ptr()),
+                Some(values.as_ptr()),
+                None,
+                None,
+                None,
+                None,
+                None,
                 output.add(row * num_heads * head_dim),
                 1,
                 length as u32,
@@ -117,6 +122,7 @@ fn ancestor_attention<const HEAD_DIM: u32>(
                 None,
                 num_heads as u32,
                 1,
+                false,
                 false,
                 false,
                 false,

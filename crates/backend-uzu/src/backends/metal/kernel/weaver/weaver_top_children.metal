@@ -8,18 +8,8 @@
 
 using namespace metal;
 
-#define GUMBEL_THREADGROUP_SIZE 1024u
-#define GUMBEL_WORDS_PER_OFFSET 4u
-
-METAL_FUNC uint2 gumbel_revidx(uint logit_idx, uint vocab_size) {
-  const uint thread_idx = logit_idx % GUMBEL_THREADGROUP_SIZE;
-  const uint thread_offset = div_ceil(vocab_size, GUMBEL_THREADGROUP_SIZE * GUMBEL_WORDS_PER_OFFSET) * thread_idx;
-  const uint block_idx = logit_idx / GUMBEL_THREADGROUP_SIZE;
-  return uint2(thread_offset + block_idx / GUMBEL_WORDS_PER_OFFSET, block_idx % GUMBEL_WORDS_PER_OFFSET);
-}
-
-METAL_FUNC float gumbel_noise(uint64_t seed, uint logit_idx, uint vocab_size) {
-  const uint2 offset_word = gumbel_revidx(logit_idx, vocab_size);
+METAL_FUNC float gumbel_noise(uint64_t seed, uint logit_idx) {
+  const uint2 offset_word = gumbel_noise_coords(logit_idx);
   PhiloxState rng;
   philox_init(&rng, seed, offset_word.x);
   const float uniform = float(rng.output[offset_word.y]) * (1.0f / 4294967296.0f);
@@ -73,9 +63,9 @@ PUBLIC KERNEL(WeaverTopChildren)(
   const uint first_token = first_valid ? uint(candidate_ids[base + first_index]) : 0xffffffffu;
   const uint second_token = second_valid ? uint(candidate_ids[base + second_index]) : 0xffffffffu;
   const uint first_score =
-      first_valid ? top_k_score_key(first_logit + gumbel_noise(seed, first_token, vocab_size)) : 0u;
+      first_valid ? top_k_score_key(first_logit + gumbel_noise(seed, first_token)) : 0u;
   const uint second_score =
-      second_valid ? top_k_score_key(second_logit + gumbel_noise(seed, second_token, vocab_size)) : 0u;
+      second_valid ? top_k_score_key(second_logit + gumbel_noise(seed, second_token)) : 0u;
   bool first_active = first_valid;
   bool second_active = second_valid;
 

@@ -43,6 +43,7 @@ pub struct Attention<B: Backend> {
     data_type: DataType,
     qkv: LinearProjection<B>,
     prepare: <B::Kernels as Kernels>::AttentionPrepareKernel,
+    prepare_kv_q8: Option<<B::Kernels as Kernels>::AttentionPrepareKernel>,
     gate_projection: Option<Box<dyn Linear<B>>>,
     sinks: Option<Allocation<B>>,
     flat_core: AttentionCores<B>,
@@ -157,8 +158,28 @@ impl<B: Backend> Attention<B> {
             DataType::F32,
             !is_kv_sharing,
             rope_config.is_some(),
+            false,
         )
         .map_err(AttentionNewError::Backend)?;
+        // Whether the KV cache this layer READS is int8 — decided by the
+        // same predicate the state uses, so a KV-sharing layer builds the
+        // q8 core variants matching its owner's quantized cache. Only the
+        // WRITE side (the q8 prepare) is skipped for sharing layers: the
+        // owner appends the KV.
+        let kv_int8 = state::kv_int8_eligible(head_dim, data_type);
+        let prepare_kv_q8 = (kv_int8 && !is_kv_sharing)
+            .then(|| {
+                <B::Kernels as Kernels>::AttentionPrepareKernel::new(
+                    context,
+                    data_type,
+                    DataType::F32,
+                    true,
+                    rope_config.is_some(),
+                    true,
+                )
+            })
+            .transpose()
+            .map_err(AttentionNewError::Backend)?;
         let sinks = config
             .has_sinks
             .then(|| parameter_tree.leaf("sinks")?.validate(&[num_q_heads], data_type)?.read_allocation())
@@ -178,6 +199,7 @@ impl<B: Backend> Attention<B> {
                 sliding_window_size,
                 scale: config.scale,
                 data_type,
+                kv_int8,
             },
             context,
         )
@@ -195,6 +217,7 @@ impl<B: Backend> Attention<B> {
                 sliding_window_size,
                 scale: config.scale,
                 data_type,
+                kv_int8,
             },
             context,
         )
@@ -228,6 +251,7 @@ impl<B: Backend> Attention<B> {
                     norm: qkv_norm,
                 },
                 prepare,
+                prepare_kv_q8,
                 gate_projection,
                 sinks,
                 flat_core,

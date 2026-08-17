@@ -22,8 +22,13 @@ VARIANTS(T, float, half, bfloat)
 VARIANTS(HEAD_DIM, 64, 128, 256, 512)
 PUBLIC KERNEL(AttentionTwoPass1)(
     const device T* queries,
-    const device T* keys,
-    const device T* values,
+    const device T* keys OPTIONAL(!kv_int8),
+    const device T* values OPTIONAL(!kv_int8),
+    const device char* keys_q8 OPTIONAL(kv_int8),
+    const device char* values_q8 OPTIONAL(kv_int8),
+    const device float* key_scales OPTIONAL(kv_int8),
+    const device float* value_scales OPTIONAL(kv_int8),
+    const constant uint& num_kv_heads OPTIONAL(kv_int8),
     device float* out,
     device float* sums,
     device float* maxs,
@@ -41,6 +46,7 @@ PUBLIC KERNEL(AttentionTwoPass1)(
     const constant uint& sliding_window_size OPTIONAL(is_sliding_window),
     const device T* sinks OPTIONAL(has_sinks),
     const bool has_sinks SPECIALIZE,
+    const bool kv_int8 SPECIALIZE,
     const bool is_kv_cache_ring SPECIALIZE,
     const bool is_causal SPECIALIZE,
     const bool is_trie SPECIALIZE,
@@ -72,8 +78,18 @@ PUBLIC KERNEL(AttentionTwoPass1)(
   thread U o[elements_per_thread] = {0};
 
   queries += q_offset * HEAD_DIM + thread_context.simd_lane_id * elements_per_thread;
-  keys += kv_head_idx * k_head_stride + block_idx * k_seq_stride + thread_context.simd_lane_id * elements_per_thread;
-  values += kv_head_idx * v_head_stride + block_idx * v_seq_stride + thread_context.simd_lane_id * elements_per_thread;
+  if (kv_int8) {
+    keys_q8 +=
+        kv_head_idx * k_head_stride + block_idx * k_seq_stride + thread_context.simd_lane_id * elements_per_thread;
+    values_q8 +=
+        kv_head_idx * v_head_stride + block_idx * v_seq_stride + thread_context.simd_lane_id * elements_per_thread;
+    key_scales += kv_head_idx;
+    value_scales += kv_head_idx;
+  } else {
+    keys += kv_head_idx * k_head_stride + block_idx * k_seq_stride + thread_context.simd_lane_id * elements_per_thread;
+    values +=
+        kv_head_idx * v_head_stride + block_idx * v_seq_stride + thread_context.simd_lane_id * elements_per_thread;
+  }
   out += o_offset * TOTAL_BLOCKS_COUNT * HEAD_DIM + block_idx * HEAD_DIM +
          thread_context.simd_lane_id * elements_per_thread;
   sums += o_offset * TOTAL_BLOCKS_COUNT + block_idx;
@@ -107,8 +123,15 @@ PUBLIC KERNEL(AttentionTwoPass1)(
         )) {
       // Compute score
       U score = 0;
-      for (uint j = 0; j < elements_per_thread; j++) {
-        score += q[j] * static_cast<U>(keys[j]);
+      if (kv_int8) {
+        for (uint j = 0; j < elements_per_thread; j++) {
+          score += q[j] * static_cast<U>(keys_q8[j]);
+        }
+        score *= key_scales[i * num_kv_heads];
+      } else {
+        for (uint j = 0; j < elements_per_thread; j++) {
+          score += q[j] * static_cast<U>(keys[j]);
+        }
       }
       score = simd_sum(score);
 
@@ -119,13 +142,25 @@ PUBLIC KERNEL(AttentionTwoPass1)(
       max_score = new_max;
       sum_exp_score = sum_exp_score * factor + exp_score;
 
-      for (uint j = 0; j < elements_per_thread; j++) {
-        o[j] = o[j] * factor + exp_score * static_cast<U>(values[j]);
+      if (kv_int8) {
+        const U weighted = exp_score * static_cast<U>(value_scales[i * num_kv_heads]);
+        for (uint j = 0; j < elements_per_thread; j++) {
+          o[j] = o[j] * factor + weighted * static_cast<U>(values_q8[j]);
+        }
+      } else {
+        for (uint j = 0; j < elements_per_thread; j++) {
+          o[j] = o[j] * factor + exp_score * static_cast<U>(values[j]);
+        }
       }
     }
 
-    keys += TOTAL_BLOCKS_COUNT * k_seq_stride;
-    values += TOTAL_BLOCKS_COUNT * v_seq_stride;
+    if (kv_int8) {
+      keys_q8 += TOTAL_BLOCKS_COUNT * k_seq_stride;
+      values_q8 += TOTAL_BLOCKS_COUNT * v_seq_stride;
+    } else {
+      keys += TOTAL_BLOCKS_COUNT * k_seq_stride;
+      values += TOTAL_BLOCKS_COUNT * v_seq_stride;
+    }
   }
 
   // Write partial output

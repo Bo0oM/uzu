@@ -24,7 +24,10 @@ use crate::{
             stream::{LanguageModelStreamError, LanguageModelStreamOptions},
         },
     },
-    speculators::dflash_tfm::{DFlashTfmTreeConstructionMethod, DFlashTfmTreeShape},
+    speculators::{
+        Speculator,
+        dflash_tfm::{DFlashTfmTreeConstructionMethod, DFlashTfmTreeShape},
+    },
     trie::TrieNode,
 };
 
@@ -104,6 +107,13 @@ enum DecodingState<B: Backend> {
     Invalid,
 }
 
+// PROBE (UZU_SPEC_DEBUG=1): per-pass acceptance trace for prompt-lookup
+// tuning; one stderr line per drafted pass.
+fn spec_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("UZU_SPEC_DEBUG").is_ok_and(|v| v != "0"))
+}
+
 fn prefill_chunk_parts(
     input_chunk: &[u64],
     last_batch: bool,
@@ -125,6 +135,13 @@ pub struct LanguageModelStream<'a, B: Backend> {
     context_ring: Option<Allocation<B>>,
     decoding_state: DecodingState<B>,
     metrics: TokenStreamMetrics,
+    /// Prompt-lookup acceptance feedback: drafted passes and tokens accepted
+    /// in the current window; when the window closes with a poor rate,
+    /// spec_cooldown pauses drafting for a stretch of plain passes.
+    spec_window_passes: u32,
+    spec_window_accepted: u32,
+    spec_cooldown: u32,
+    spec_streak: u32,
 }
 
 impl<'a, B: Backend> LanguageModelStream<'a, B> {
@@ -211,7 +228,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
             let mut output_norm = None;
             let split_logits_row = model.decoder.prefill_cache_skips_trailing_layers();
             let hidden_feature_layer_indices =
-                model.speculator.as_ref().map(|speculator| speculator.hidden_feature_layer_indices());
+                model.speculator.as_ref().and_then(|speculator| speculator.hidden_feature_layer_indices());
 
             for (input_chunk, sample_last) in input
                 .chunks(max_batch_size)
@@ -301,7 +318,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                     .encode_accept(&(0..input_chunk.len() as u32).collect::<Box<[u32]>>(), &mut encoder)
                     .map_err(LanguageModelStreamError::Backend)?;
 
-                if let Some(speculator) = model.speculator.as_ref() {
+                if let Some(Speculator::DFlash(speculator)) = model.speculator.as_ref() {
                     let speculator_state = model_state.speculator_state.as_mut().unwrap();
                     speculator
                         .encode_accept(
@@ -357,6 +374,12 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
             context_ring,
             decoding_state,
             metrics,
+            spec_window_passes: 0,
+            spec_window_accepted: 0,
+            // Drafting starts paused: the lookup streak has to prove a
+            // verbatim span before the first batched pass is spent.
+            spec_cooldown: u32::MAX,
+            spec_streak: 0,
         })
     }
 
@@ -405,6 +428,40 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                             (norm, row_bytes)
                         });
                         self.metrics.num_tokens_accepted += full.len();
+                        if matches!(self.model.speculator, Some(Speculator::PromptLookup(_))) {
+                            // Window over drafted passes only (trigram-gated,
+                            // so free prose rarely drafts at all). The full
+                            // m=4 engine pass costs ~3x the m=1 pass (batched
+                            // GEMV is 1.5x, the rest is trie attention,
+                            // 4-row sampling and encode overhead — measured
+                            // via the chat regression at threshold 1.6), so
+                            // a window must average 3 accepted tokens per
+                            // pass to keep drafting; a failed 4-pass probe
+                            // pauses drafting until the lookup-streak signal
+                            // (see full_batch_size) reports a verbatim span,
+                            // bounding chat overhead at one probe per stream.
+                            self.spec_window_passes += 1;
+                            self.spec_window_accepted += full.len() as u32;
+                            if spec_debug_enabled() {
+                                let proposed: Vec<u64> =
+                                    forward_pass_pending.input_trie.linearize().token_ids().collect();
+                                let actual: Vec<u64> = full.iter().map(|(_, _, out)| *out).collect();
+                                eprintln!(
+                                    "SPEC_PASS accepted={} proposed={:?} actual={:?} cooldown={}",
+                                    full.len(),
+                                    proposed,
+                                    actual,
+                                    self.spec_cooldown
+                                );
+                            }
+                            if self.spec_window_passes == 4 {
+                                if self.spec_window_accepted < 12 {
+                                    self.spec_cooldown = u32::MAX;
+                                }
+                                self.spec_window_passes = 0;
+                                self.spec_window_accepted = 0;
+                            }
+                        }
                         self.decoding_state = DecodingState::Accepting {
                             full,
                             num_accepted: 0,
@@ -449,7 +506,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                             .transformer_state
                             .encode_accept(&accepted_token_indicies, &mut encoder)
                             .map_err(LanguageModelStreamError::Backend)?;
-                        if let Some(speculator) = self.model.speculator.as_ref() {
+                        if let Some(Speculator::DFlash(speculator)) = self.model.speculator.as_ref() {
                             speculator
                                 .encode_accept(
                                     self.model_state.speculator_state.as_mut().unwrap(),
@@ -547,12 +604,41 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
             None
         };
 
-        let full_batch_size = self.model.speculator.as_ref().map_or(1, |speculator| {
-            if speculator.has_weaver() {
-                32
-            } else {
-                16
-            }
+        let full_batch_size = self.model.speculator.as_ref().map_or(1, |speculator| match speculator {
+            Speculator::DFlash(speculator) => {
+                if speculator.has_weaver() {
+                    32
+                } else {
+                    16
+                }
+            },
+            Speculator::PromptLookup(speculator) => {
+                // A failed probe pauses GPU drafting indefinitely; the pause
+                // ends when the CPU-side lookup lands full-length drafts on
+                // eight consecutive (already known) positions — long enough
+                // that paraphrase-length reuse does not re-enter, only a
+                // genuinely verbatim span. The signal runs a pass behind the
+                // GPU, which is fine for a re-entry trigger.
+                if self.spec_cooldown > 0 {
+                    let tokens = &self.model_state.tokens;
+                    let streak_hit = tokens.len() >= 2
+                        && speculator.would_draft_fully(&tokens[..tokens.len() - 1], tokens[tokens.len() - 1]);
+                    if streak_hit {
+                        self.spec_streak += 1;
+                    } else {
+                        self.spec_streak = 0;
+                    }
+                    if self.spec_streak >= 8 {
+                        self.spec_cooldown = 0;
+                        self.spec_streak = 0;
+                        speculator.batch_size()
+                    } else {
+                        1
+                    }
+                } else {
+                    speculator.batch_size()
+                }
+            },
         });
         let speculation_batch = self
             .model_state
@@ -561,38 +647,90 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
 
         let mut pending = Vec::new();
         let (input_trie, chain_copy, full_accept) = if speculation_batch > 1
-            && let Some(speculator) = &self.model.speculator
-            && let (root_token, Some(output_norm)) = prev_output.resolve(
+            && let Some(active_speculator) = self.model.speculator.as_ref()
+        {
+            let (root_token, output_norm) = prev_output.resolve(
                 &mut self.model_state.tokens,
                 #[cfg(grammar)]
                 self.options.grammar.as_mut(),
-            )? {
-            if let Some(accept_encoder) = encoder.take() {
-                pending.push(accept_encoder.end_encoding().submit());
-            }
-            let trie = speculator.propose_tree(
-                self.model_state.speculator_state.as_mut().unwrap(),
-                output_norm,
-                root_token as u32,
-                self.model.decoder.embedding(),
-                DFlashTfmTreeShape {
-                    budget: speculation_batch,
-                    construction_method: if speculator.has_weaver() {
-                        DFlashTfmTreeConstructionMethod::Weaver {
-                            depth: 16,
-                            expand_per_round: 4,
-                            expand_width: 4,
-                        }
-                    } else {
-                        DFlashTfmTreeConstructionMethod::Argmax
-                    },
-                },
-                #[cfg(grammar)]
-                self.options.grammar.as_mut(),
-                &self.model_state.prng,
-                self.allocation_pool.clone(),
             )?;
-            (trie, None, false)
+            match (active_speculator, output_norm) {
+                (Speculator::DFlash(speculator), Some(output_norm)) => {
+                    if let Some(accept_encoder) = encoder.take() {
+                        pending.push(accept_encoder.end_encoding().submit());
+                    }
+                    let trie = speculator.propose_tree(
+                        self.model_state.speculator_state.as_mut().unwrap(),
+                        output_norm,
+                        root_token as u32,
+                        self.model.decoder.embedding(),
+                        DFlashTfmTreeShape {
+                            budget: speculation_batch,
+                            construction_method: if speculator.has_weaver() {
+                                DFlashTfmTreeConstructionMethod::Weaver {
+                                    depth: 16,
+                                    expand_per_round: 4,
+                                    expand_width: 4,
+                                }
+                            } else {
+                                DFlashTfmTreeConstructionMethod::Argmax
+                            },
+                        },
+                        #[cfg(grammar)]
+                        self.options.grammar.as_mut(),
+                        &self.model_state.prng,
+                        self.allocation_pool.clone(),
+                    )?;
+                    (trie, None, false)
+                },
+                (Speculator::PromptLookup(speculator), _) => {
+                    // resolve() appended root_token, so the searchable
+                    // history is everything before it.
+                    let tokens = &self.model_state.tokens;
+                    let mut drafts = speculator.propose(&tokens[..tokens.len() - 1], root_token);
+                    // The batch clamp near the context limit caps the chain.
+                    drafts.truncate(speculation_batch as usize - 1);
+                    #[cfg(grammar)]
+                    let drafts = if let Some(grammar) = self.options.grammar.as_mut() {
+                        // Mirror the DFlash tree builder: drafts advance the
+                        // grammar as they are proposed; the first rejected
+                        // draft truncates the chain.
+                        let mut checked = Vec::with_capacity(drafts.len());
+                        for &draft in &drafts {
+                            if grammar.accept_token(draft).is_err() {
+                                break;
+                            }
+                            checked.push(draft);
+                        }
+                        checked
+                    } else {
+                        drafts
+                    };
+                    let mut root = TrieNode::new(root_token, self.model_state.prng.derive(context_length as u64));
+                    if drafts.is_empty() {
+                        (root, None, true)
+                    } else {
+                        let mut chain: Option<TrieNode> = None;
+                        for (depth, &draft) in drafts.iter().enumerate().rev() {
+                            let mut node = TrieNode::new(
+                                draft,
+                                self.model_state.prng.derive(context_length as u64 + depth as u64 + 1),
+                            );
+                            if let Some(child) = chain.take() {
+                                let _ = node.add(child);
+                            }
+                            chain = Some(node);
+                        }
+                        if let Some(child) = chain {
+                            let _ = root.add(child);
+                        }
+                        (root, None, false)
+                    }
+                },
+                (Speculator::DFlash(_), None) => {
+                    (TrieNode::new(root_token, self.model_state.prng.derive(context_length as u64)), None, true)
+                },
+            }
         } else {
             let (token, chain_copy) = match &prev_output {
                 ForwardPassChaining::Constant {
@@ -634,7 +772,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
             .map_err(LanguageModelStreamError::Backend)?;
 
         let hidden_feature_layer_indices =
-            self.model.speculator.as_ref().map(|speculator| speculator.hidden_feature_layer_indices());
+            self.model.speculator.as_ref().and_then(|speculator| speculator.hidden_feature_layer_indices());
 
         let decoder_output = self.model.decoder.encode(
             &token_ids,
@@ -727,7 +865,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                 .encode_accept(&(0..batch_dim.size()).collect::<Box<[u32]>>(), &mut encoder)
                 .map_err(LanguageModelStreamError::Backend)?;
 
-            if let Some(speculator) = self.model.speculator.as_ref() {
+            if let Some(Speculator::DFlash(speculator)) = self.model.speculator.as_ref() {
                 let speculator_state = self.model_state.speculator_state.as_mut().unwrap();
                 speculator
                     .encode_accept(
@@ -817,7 +955,7 @@ impl<'a, B: Backend> Drop for LanguageModelStream<'a, B> {
                     )
                     .unwrap();
                     self.model_state.transformer_state.encode_accept(&[0], &mut encoder).unwrap();
-                    if let Some(speculator) = self.model.speculator.as_ref() {
+                    if let Some(Speculator::DFlash(speculator)) = self.model.speculator.as_ref() {
                         speculator
                             .encode_accept(
                                 self.model_state.speculator_state.as_mut().unwrap(),
@@ -850,7 +988,7 @@ impl<'a, B: Backend> Drop for LanguageModelStream<'a, B> {
                 let accepted_token_indicies =
                     full.iter().take(num_accepted + 1).map(|(i, _, _)| *i as u32).collect::<Box<[u32]>>();
                 self.model_state.transformer_state.encode_accept(&accepted_token_indicies, &mut encoder).unwrap();
-                if let Some(speculator) = self.model.speculator.as_ref() {
+                if let Some(Speculator::DFlash(speculator)) = self.model.speculator.as_ref() {
                     speculator
                         .encode_accept(
                             self.model_state.speculator_state.as_mut().unwrap(),

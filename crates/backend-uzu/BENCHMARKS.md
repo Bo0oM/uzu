@@ -28,22 +28,30 @@ Benchmarks live inside the `backend-uzu` library test target (registered
 with `#[uzu_bench]` under `crates/backend-uzu/tests/unit/`), so the Cargo
 target is `--lib`.
 
-| Group id                                | Filter                              |
-|-----------------------------------------|-------------------------------------|
-| `Metal/Kernel/Matmul/GEMM`              | `Metal/Kernel/Matmul/GEMM`          |
-| `Metal/Kernel/Matmul/GEMM_MXU`          | `Metal/Kernel/Matmul/GEMM_MXU`      |
-| `Metal/Kernel/A8W/w4`, `.../w8`         | `Metal/Kernel/A8W`                  |
-| `Metal/Kernel/UnifiedQuantizedGemm/...` | `Metal/Kernel/UnifiedQuantizedGemm` |
-| `Metal/Kernel/Gemv/...`                 | `Metal/Kernel/Gemv`                 |
-| `Metal/Kernel/Qwen3Layers/...`          | `Metal/Kernel/Qwen3Layers`          |
-| `Metal/Kernel/RMSNorm`                  | `Metal/Kernel/RMSNorm`              |
-| `Metal/Kernel/Sampling/Argmax`          | `Metal/Kernel/Sampling/Argmax`      |
-| `ChatSession run`                       | `ChatSession run`                   |
-| `Forward pass`                          | `Forward pass`                      |
+| Group id                                    | Filter                              | Declared in |
+|---------------------------------------------|-------------------------------------|---------------|
+| `Metal/Kernel/Matmul/GEMM`, `.../GEMM_MXU`   | `Metal/Kernel/Matmul`               | `matmul/gemm_bench.rs` |
+| `Metal/Kernel/A8W/w4`, `.../w8`              | `Metal/Kernel/A8W`                  | `matmul/a8w_bench.rs` |
+| `Metal/Kernel/UnifiedQuantizedGemm/…`        | `Metal/Kernel/UnifiedQuantizedGemm` | `matmul/quant_gemm_bench.rs` |
+| `Metal/Kernel/Gemv/…`                        | `Metal/Kernel/Gemv`                 | `matmul/quant_gemv_bench.rs` |
+| `Metal/Kernel/Qwen3Layers/…`                 | `Metal/Kernel/Qwen3Layers`          | `matmul/qwen3_bench.rs` |
+| `Metal/Kernel/GDNTreeVerify/…`               | `Metal/Kernel/GDNTreeVerify`        | `gdn/tree_verify/*_bench.rs` |
+| `Model loading`                              | `Model loading`                     | `session/model_loading_bench.rs` |
+
+The prefix is substituted per backend (`Metal` or `Cpu`), so the same groups also exist
+under `Cpu/Kernel/…`.
 
 The prefix `Metal/Kernel/Matmul` runs both `GEMM` and `GEMM_MXU` in one pass.
-The session and language-model groups require the test model path configured by
-the test helpers.
+`Model loading` requires the test model path configured by the test helpers
+(`TEST_MODEL`, see `crates/test-runner/src/path.rs`).
+
+**What is not here yet.** There are no benchmark groups for `RMSNorm`, the sampling
+kernels, `ChatSession run`, or a whole forward pass; adding them is a separate task.
+
+Until they exist, end-to-end numbers come from `cli bench <model_path> <task_path>
+<output_path>` (`crates/cli/src/bench/`): TTFT, prompt t/s, generate t/s, memory, average
+power, joules per token, N runs with mean and deviation. `greedy: true` in the task gives a
+deterministic output suitable for byte-exact comparison.
 
 ## Output layout
 

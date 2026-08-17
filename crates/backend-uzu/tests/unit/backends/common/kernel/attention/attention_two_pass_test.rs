@@ -96,6 +96,7 @@ fn get_first_pass_output<T: ArrayElement + Float, B: Backend>(input: &FirstPassI
         input.head_dim,
         false,
         false,
+        false,
         input.do_causal,
         false,
         false,
@@ -118,8 +119,13 @@ fn get_first_pass_output<T: ArrayElement + Float, B: Backend>(input: &FirstPassI
     let mut encoder = Encoder::new(context.as_ref()).expect("Failed to create encoder");
     kernel.encode(
         &queries,
-        &keys,
-        &values,
+        Some(&keys),
+        Some(&values),
+        None::<&Allocation<B>>,
+        None::<&Allocation<B>>,
+        None::<&Allocation<B>>,
+        None::<&Allocation<B>>,
+        None,
         &mut partials,
         &mut sums,
         &mut maxs,

@@ -18,6 +18,7 @@ pub struct AttentionTwoPassCore<B: Backend> {
     scale: Option<f32>,
     data_type: DataType,
     pass_1: <B::Kernels as Kernels>::AttentionTwoPass1Kernel,
+    pass_1_q8: Option<<B::Kernels as Kernels>::AttentionTwoPass1Kernel>,
     pass_2: <B::Kernels as Kernels>::AttentionTwoPass2Kernel,
 }
 
@@ -26,16 +27,21 @@ impl<B: Backend> AttentionTwoPassCore<B> {
         arguments: &AttentionCoreNewArguments,
         context: &B::Context,
     ) -> Result<Self, B::Error> {
-        let pass_1 = <B::Kernels as Kernels>::AttentionTwoPass1Kernel::new(
-            context,
-            arguments.data_type,
-            arguments.head_dim,
-            arguments.has_sinks,
-            arguments.is_kv_cache_ring,
-            arguments.is_causal,
-            arguments.is_trie,
-            arguments.sliding_window_size.is_some(),
-        )?;
+        let make_pass_1 = |kv_int8: bool| {
+            <B::Kernels as Kernels>::AttentionTwoPass1Kernel::new(
+                context,
+                arguments.data_type,
+                arguments.head_dim,
+                arguments.has_sinks,
+                kv_int8,
+                arguments.is_kv_cache_ring,
+                arguments.is_causal,
+                arguments.is_trie,
+                arguments.sliding_window_size.is_some(),
+            )
+        };
+        let pass_1 = make_pass_1(false)?;
+        let pass_1_q8 = arguments.kv_int8.then(|| make_pass_1(true)).transpose()?;
 
         let pass_2 =
             <B::Kernels as Kernels>::AttentionTwoPass2Kernel::new(context, arguments.data_type, arguments.head_dim)?;
@@ -48,6 +54,7 @@ impl<B: Backend> AttentionTwoPassCore<B> {
             scale: arguments.scale,
             data_type: arguments.data_type,
             pass_1,
+            pass_1_q8,
             pass_2,
         })
     }
@@ -70,28 +77,61 @@ impl<B: Backend> AttentionTwoPassCore<B> {
             INNER_DATA_TYPE,
         )?;
 
-        self.pass_1.encode(
-            arguments.queries,
-            arguments.keys,
-            arguments.values,
-            &mut partials,
-            &mut sums,
-            &mut maxs,
-            self.num_q_heads / self.num_groups,
-            arguments.state_type.physical_prefix_length() + arguments.suffix_length,
-            self.head_dim,
-            self.num_groups * self.head_dim,
-            self.head_dim,
-            self.num_groups * self.head_dim,
-            arguments.state_type.ring_params(),
-            self.scale.unwrap_or(1.0f32 / (self.head_dim as f32).sqrt()),
-            self.num_q_heads,
-            arguments.suffix_length,
-            arguments.trie,
-            self.sliding_window_size,
-            arguments.sinks,
-            encoder,
-        );
+        macro_rules! encode_pass_1 {
+            ($kernel:expr, $keys:expr, $values:expr, $keys_q8:expr, $values_q8:expr, $key_scales:expr, $value_scales:expr, $num_kv_heads:expr) => {
+                $kernel.encode(
+                    arguments.queries,
+                    $keys,
+                    $values,
+                    $keys_q8,
+                    $values_q8,
+                    $key_scales,
+                    $value_scales,
+                    $num_kv_heads,
+                    &mut partials,
+                    &mut sums,
+                    &mut maxs,
+                    self.num_q_heads / self.num_groups,
+                    arguments.state_type.physical_prefix_length() + arguments.suffix_length,
+                    self.head_dim,
+                    self.num_groups * self.head_dim,
+                    self.head_dim,
+                    self.num_groups * self.head_dim,
+                    arguments.state_type.ring_params(),
+                    self.scale.unwrap_or(1.0f32 / (self.head_dim as f32).sqrt()),
+                    self.num_q_heads,
+                    arguments.suffix_length,
+                    arguments.trie,
+                    self.sliding_window_size,
+                    arguments.sinks,
+                    encoder,
+                )
+            };
+        }
+        if let Some(kv_quant) = arguments.kv_quant {
+            let kernel = self.pass_1_q8.as_ref().expect("quantized KV cache requires the int8 kernel variant");
+            encode_pass_1!(
+                kernel,
+                None::<&Allocation<B>>,
+                None::<&Allocation<B>>,
+                Some(arguments.keys),
+                Some(arguments.values),
+                Some(kv_quant.key_scales),
+                Some(kv_quant.value_scales),
+                Some(self.num_groups)
+            );
+        } else {
+            encode_pass_1!(
+                self.pass_1,
+                Some(arguments.keys),
+                Some(arguments.values),
+                None::<&Allocation<B>>,
+                None::<&Allocation<B>>,
+                None::<&Allocation<B>>,
+                None::<&Allocation<B>>,
+                None
+            );
+        }
 
         let mut output = encoder
             .allocate_constant_for_shape(&[arguments.suffix_length, self.num_q_heads, self.head_dim], self.data_type)?;

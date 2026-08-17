@@ -236,8 +236,13 @@ fn run_single_pass_attention(
 
     kernel.encode(
         &query_buffer,
-        &key_cache_buffer,
-        &value_cache_buffer,
+        Some(&key_cache_buffer),
+        Some(&value_cache_buffer),
+        None::<&Allocation<Metal>>,
+        None::<&Allocation<Metal>>,
+        None::<&Allocation<Metal>>,
+        None::<&Allocation<Metal>>,
+        None,
         &mut output_buffer,
         (num_heads / num_kv_heads) as u32,
         seq_len as u32,
@@ -274,6 +279,7 @@ fn create_single_pass_kernel(
         head_dim as u32,
         has_sinks,
         false,
+        false,
         is_causal,
         false,
         false,
@@ -294,6 +300,7 @@ fn create_two_pass_kernels(
             context,
             DataType::F32,
             head_dim as u32,
+            false,
             false,
             false,
             is_causal,
@@ -331,6 +338,7 @@ fn run_gemm_attention(
             sliding_window_size: None,
             scale: Some(scale),
             data_type: DataType::F32,
+            kv_int8: false,
         },
     )?;
 
@@ -353,6 +361,7 @@ fn run_gemm_attention(
         trie: None,
         sinks: sinks_allocation.as_ref(),
         state_type: &state_type,
+        kv_quant: None,
     };
 
     let pooled_output = core.encode(args, &mut encoder)?;
@@ -582,8 +591,13 @@ fn run_two_pass_attention(
 
     kernel_pass1.encode(
         &queries_buffer,
-        &keys_buffer,
-        &values_buffer,
+        Some(&keys_buffer),
+        Some(&values_buffer),
+        None::<&Allocation<Metal>>,
+        None::<&Allocation<Metal>>,
+        None::<&Allocation<Metal>>,
+        None::<&Allocation<Metal>>,
+        None,
         &mut partials_buffer,
         &mut sums_buffer,
         &mut maxs_buffer,
@@ -707,8 +721,13 @@ fn perf_two_pass_attention() {
     let sinks_allocation: Option<Allocation<Metal>> = None;
     kernel_pass1.encode(
         &queries_buffer,
-        &keys_buffer,
-        &values_buffer,
+        Some(&keys_buffer),
+        Some(&values_buffer),
+        None::<&Allocation<Metal>>,
+        None::<&Allocation<Metal>>,
+        None::<&Allocation<Metal>>,
+        None::<&Allocation<Metal>>,
+        None,
         &mut partials_buffer,
         &mut sums_buffer,
         &mut maxs_buffer,

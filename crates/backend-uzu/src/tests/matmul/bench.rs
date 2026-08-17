@@ -41,6 +41,16 @@ fn start_benchmark_capture<B: Backend>(
     true
 }
 
+#[cfg(all(feature = "metal", target_os = "ios"))]
+fn drain_autoreleased<T>(f: impl FnOnce() -> T) -> T {
+    objc2::rc::autoreleasepool(|_| f())
+}
+
+#[cfg(not(all(feature = "metal", target_os = "ios")))]
+fn drain_autoreleased<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
 pub fn iter_encode_loop<B: Backend, F>(
     context: &B::Context,
     bencher: &mut Bencher,
@@ -59,16 +69,36 @@ pub fn iter_encode_loop_named<B: Backend, F>(
 ) where
     F: FnMut(&mut Encoder<B>),
 {
-    bencher.iter_custom(|n_iters| {
+    // Encoding every iteration into one command buffer makes its host-side
+    // footprint proportional to n_iters (criterion ramps it into the hundreds
+    // of thousands), which trips the jetsam limit on iPhone. Chunking bounds
+    // the footprint; the GPU execution times of the chunks simply add up.
+    // On iOS a single command buffer must also finish inside the GPU watchdog
+    // budget (seconds), so slow kernels need far smaller chunks: override
+    // with UZU_BENCH_ITERS_PER_CB.
+    let iters_per_command_buffer: u64 =
+        std::env::var("UZU_BENCH_ITERS_PER_CB").ok().and_then(|value| value.parse().ok()).unwrap_or(8192);
+    bencher.iter_custom(move |n_iters| {
         let capture = start_benchmark_capture::<B>(context, benchmark_path);
-        let mut encoder = Encoder::<B>::new(context).unwrap();
-        for _ in 0..n_iters {
-            encode(&mut encoder);
+        let mut total = std::time::Duration::ZERO;
+        let mut remaining = n_iters;
+        while remaining > 0 {
+            let chunk = remaining.min(iters_per_command_buffer);
+            // On iOS the autoreleased command-buffer objects of a long bench
+            // loop accumulate to a jetsam kill without a pool drain per chunk.
+            total += drain_autoreleased(|| {
+                let mut encoder = Encoder::<B>::new(context).unwrap();
+                for _ in 0..chunk {
+                    encode(&mut encoder);
+                }
+                let completed = encoder.end_encoding().submit().wait_until_completed().unwrap();
+                completed.gpu_execution_time()
+            });
+            remaining -= chunk;
         }
-        let completed = encoder.end_encoding().submit().wait_until_completed().unwrap();
         if capture {
             context.stop_capture().expect("failed to stop benchmark GPU capture");
         }
-        completed.gpu_execution_time()
+        total
     });
 }

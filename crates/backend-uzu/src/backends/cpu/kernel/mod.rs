@@ -37,4 +37,5 @@ impl Kernels for CpuKernels {
     type DeltaNetTreeVerify = Infallible;
     type MatmulKernel = matmul::MatmulCpuKernel;
     type RadixTopKSmall = radix_top_k_small::CpuRadixTopKSmall;
+    type UnifiedSamplingKernel = sampling::unified_sampling::UnifiedSamplingCpuKernel;
 }

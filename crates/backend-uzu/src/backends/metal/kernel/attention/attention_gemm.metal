@@ -112,7 +112,12 @@ KERNEL(AttentionGemm)(
   using ScoreFragment = Fragment<AccumType, QUERY_ROW_FRAGMENTS, KEY_COL_FRAGMENTS, Ops>;
   QueryFragment query_frags[QUERY_FRAGMENT_COUNT];
   ScoreFragment score_fragment;
-  constexpr int VALUE_COL_FRAGMENTS = USE_MXU ? 2 : HEAD_DIM_FRAGMENTS;
+  // Caps the register-resident PV operand; BD=256 otherwise needs 128 float regs per lane.
+  constexpr int MAX_SIMDGROUP_VALUE_COL_FRAGMENTS = 8;
+  constexpr int VALUE_COL_FRAGMENTS =
+      USE_MXU ? 2
+              : (HEAD_DIM_FRAGMENTS > MAX_SIMDGROUP_VALUE_COL_FRAGMENTS ? MAX_SIMDGROUP_VALUE_COL_FRAGMENTS
+                                                                        : HEAD_DIM_FRAGMENTS);
   static_assert(HEAD_DIM_FRAGMENTS % VALUE_COL_FRAGMENTS == 0, "head-dim must split into VALUE_COL_FRAGMENTS frags");
   static_assert(!USE_MXU || VALUE_COL_FRAGMENTS % 2 == 0, "MXU PV needs even N (VALUE_COL_FRAGMENTS)");
   constexpr int OUTPUT_CHUNKS = HEAD_DIM_FRAGMENTS / VALUE_COL_FRAGMENTS;

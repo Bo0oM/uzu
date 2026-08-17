@@ -63,21 +63,12 @@ pub fn gumbel_float(
     -f32::ln(-f32::ln(uniform_float(key, (offset, word))))
 }
 
-const THREADGROUP_SIZE: u32 = 1024;
-const WORDS_PER_OFFSET: u32 = 4;
-
-pub fn revidx(
-    logit_idx: u32,
-    vocab_size: u32,
-) -> (u32, u32) {
-    let thread_idx = logit_idx % THREADGROUP_SIZE;
-    let thread_offset = vocab_size.div_ceil(THREADGROUP_SIZE * WORDS_PER_OFFSET) * thread_idx;
-
-    let block_idx = logit_idx / THREADGROUP_SIZE;
-    let block_idx_offset = block_idx / WORDS_PER_OFFSET;
-    let block_idx_word = block_idx % WORDS_PER_OFFSET;
-
-    (thread_offset + block_idx_offset, block_idx_word)
+/// One philox block covers 4 consecutive logits, so the noise of a logit is a
+/// pure function of (seed, index) — independent of any GPU grid layout. The
+/// Metal kernels in kernel/sampling/unified_sampling.metal use the identical
+/// mapping.
+pub fn revidx(logit_idx: u32) -> (u32, u32) {
+    (logit_idx / 4, logit_idx % 4)
 }
 
 #[cfg(test)]

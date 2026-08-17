@@ -25,9 +25,9 @@ pub fn qkv_norm<
     scale_offset: f32,
     head_offset: u32,
     head_count: u32,
-    full_layer: bool,
     #[specialize] in_place: bool,
     #[specialize] has_scales: bool,
+    #[specialize] full_layer: bool,
 ) {
     let qkv_input = match in_place {
         true => qkv_output as *const InputT,

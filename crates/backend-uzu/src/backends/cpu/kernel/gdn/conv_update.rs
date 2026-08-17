@@ -12,10 +12,10 @@ pub fn delta_net_conv_update<T: ArrayElement + Float>(
     #[optional(has_bias)] bias: Option<*const f32>,
     in_out: *mut T,
     state: *mut f32,
-    kernel_size: u32,
     conv_dim: u32,
     state_stride: u32,
     #[specialize] has_bias: bool,
+    #[specialize] kernel_size: u32,
 ) {
     let kernel_size = kernel_size as usize;
     let conv_dim = conv_dim as usize;

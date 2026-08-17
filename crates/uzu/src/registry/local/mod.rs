@@ -1,4 +1,5 @@
 mod config;
+mod encoding_inference;
 
 use std::{fs, future::Future, path::Path, pin::Pin};
 
@@ -108,8 +109,13 @@ impl Registry {
 }
 
 fn load_encodings(model_path: &Path) -> Vec<Value> {
+    if std::env::var_os("UZU_ENC_TRACE").is_some() {
+        eprintln!("ENC_TRACE load_encodings {}", model_path.display());
+    }
     let Ok(text) = fs::read_to_string(model_path.join("encoding.json")) else {
-        return vec![];
+        // Side-loaded models (downloader, lalamo output) ship without an
+        // encoding.json; infer it from the model family so chat can start.
+        return encoding_inference::infer_and_persist_encodings(model_path).into_iter().map(Value::from).collect();
     };
     let parsed = serde_json::from_str::<serde_json::Value>(&text);
     match parsed {

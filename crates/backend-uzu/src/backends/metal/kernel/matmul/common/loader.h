@@ -109,6 +109,23 @@ struct ThreadgroupLoader {
     }
   }
 
+  // Full-width vectorized load for tiles that are only partial in ROWS: a
+  // thread whose row falls past valid_rows reads the last valid row instead
+  // (in bounds, real data). The duplicated rows produce garbage accumulator
+  // rows that the masked finalize never stores, so the k-loop keeps the
+  // aligned path's single vector read per row chunk instead of load_safe's
+  // per-element predicated scalars — the difference between m=4 and m=8
+  // costing the same GEMM pass.
+  METAL_FUNC void load_rows_clamped(short valid_rows) const {
+    METAL_PRAGMA_UNROLL
+    for (ushort i = 0; i < THREADGROUP_TILE_ROWS; i += THREAD_ROWS) {
+      const short row = short(tile_row_index) + short(i);
+      const short clamped_shift = (min(row, short(valid_rows - 1)) - row) * short(source_leading_dimension);
+      *reinterpret_cast<threadgroup ReadVector*>(&destination[i * DESTINATION_LEADING_DIMENSION]) =
+          *reinterpret_cast<const device ReadVector*>(&source[i * source_leading_dimension + clamped_shift]);
+    }
+  }
+
   METAL_FUNC void next() { source += tile_stride; }
 };
 

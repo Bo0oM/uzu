@@ -44,11 +44,11 @@ fn get_test_data<
     head_count: u32,
     full_layer: bool,
     has_scales: bool,
+    head_dim: u32,
 ) -> (Input<InputT, ScaleT, OutputT>, Vec<OutputT>) {
     let batch_size = 1u32;
     let num_q_heads = 4u32;
     let num_kv_heads = 2u32;
-    let head_dim = 8u32;
     let epsilon = 1e-6f32;
     let scale_offset = 0.0f32;
 
@@ -128,6 +128,7 @@ fn get_output<
         AccumT::data_type(),
         input.in_place,
         input.has_scales,
+        input.full_layer,
     )
     .expect("Failed to create QKVNormKernel");
 
@@ -146,7 +147,6 @@ fn get_output<
         input.scale_offset,
         input.head_offset,
         input.head_count,
-        input.full_layer,
         &mut encoder,
     );
     encoder.end_encoding().submit().wait_until_completed().expect("Failed to wait command buffer");
@@ -195,7 +195,7 @@ fn test_q_norm<
 >() {
     for full_layer in [true, false] {
         // Normalize Q heads: head_offset=0, head_count=num_q_heads(4)
-        let (input, expected) = get_test_data::<InputT, ScaleT, OutputT, AccumT>(0, 4, full_layer, true);
+        let (input, expected) = get_test_data::<InputT, ScaleT, OutputT, AccumT>(0, 4, full_layer, true, 8);
         test_internal::<InputT, ScaleT, OutputT, AccumT>(&input, &expected);
     }
 }
@@ -208,7 +208,7 @@ fn test_k_norm<
 >() {
     for full_layer in [true, false] {
         // Normalize K heads: head_offset=num_q_heads(4), head_count=num_kv_heads(2)
-        let (input, expected) = get_test_data::<InputT, ScaleT, OutputT, AccumT>(4, 2, full_layer, true);
+        let (input, expected) = get_test_data::<InputT, ScaleT, OutputT, AccumT>(4, 2, full_layer, true, 8);
         test_internal::<InputT, ScaleT, OutputT, AccumT>(&input, &expected);
     }
 }
@@ -219,8 +219,24 @@ fn test_v_norm_no_scales<
     OutputT: ArrayElement + Float + Debug + Display,
     AccumT: ArrayElement + Float,
 >() {
-    let (input, expected) = get_test_data::<InputT, ScaleT, OutputT, AccumT>(6, 2, true, false);
+    let (input, expected) = get_test_data::<InputT, ScaleT, OutputT, AccumT>(6, 2, true, false, 8);
     test_internal::<InputT, ScaleT, OutputT, AccumT>(&input, &expected);
+}
+
+/// head_dim 8 reaches neither the second register-prefix step nor the tail
+/// loop: lane_stride = METAL_SIMD_SIZE * GRAIN_SIZE = 128 and the cache
+/// covers 256. This test exercises both boundaries.
+fn test_head_dim_unroll_boundaries<
+    InputT: ArrayElement + Float,
+    ScaleT: ArrayElement + Float,
+    OutputT: ArrayElement + Float + Debug + Display,
+    AccumT: ArrayElement + Float,
+>() {
+    // 256 = exactly both cache steps; 320 enters the re-reading tail loop.
+    for head_dim in [128u32, 256, 320] {
+        let (input, expected) = get_test_data::<InputT, ScaleT, OutputT, AccumT>(0, 4, true, true, head_dim);
+        test_internal::<InputT, ScaleT, OutputT, AccumT>(&input, &expected);
+    }
 }
 
 fn test_addressing<
@@ -230,7 +246,7 @@ fn test_addressing<
     AccumT: ArrayElement + Float,
 >() {
     // Test that Q norm only modifies Q heads and leaves K/V untouched
-    let (input, _expected) = get_test_data::<InputT, ScaleT, OutputT, AccumT>(0, 4, false, true);
+    let (input, _expected) = get_test_data::<InputT, ScaleT, OutputT, AccumT>(0, 4, false, true, 8);
 
     let num_q_heads = input.num_q_heads as usize;
     let head_dim = input.head_dim as usize;
@@ -275,7 +291,7 @@ fn test_v_addressing<
     AccumT: ArrayElement + Float,
 >() {
     // Weightless V norm must modify only V heads and leave Q/K untouched.
-    let (input, _expected) = get_test_data::<InputT, ScaleT, OutputT, AccumT>(6, 2, true, false);
+    let (input, _expected) = get_test_data::<InputT, ScaleT, OutputT, AccumT>(6, 2, true, false, 8);
 
     let num_q_heads = input.num_q_heads as usize;
     let num_kv_heads = input.num_kv_heads as usize;
@@ -398,4 +414,15 @@ fn test_v_addressing_f32_f32_f32_f32() {
 #[uzu_test]
 fn test_v_addressing_bf16_bf16_bf16_f32() {
     test_v_addressing::<bf16, bf16, bf16, f32>();
+}
+
+// Register-prefix unroll boundaries; head_dim 8 never touches them.
+#[uzu_test]
+fn test_head_dim_unroll_boundaries_f32_f32_f32_f32() {
+    test_head_dim_unroll_boundaries::<f32, f32, f32, f32>();
+}
+
+#[uzu_test]
+fn test_head_dim_unroll_boundaries_bf16_bf16_bf16_f32() {
+    test_head_dim_unroll_boundaries::<bf16, bf16, bf16, f32>();
 }

@@ -107,6 +107,7 @@ impl<B: Backend> QKVNorm<B> {
             DataType::F32,
             true,
             scales.is_some(),
+            config.upcast_mode == UpcastMode::FullLayer,
         )
         .map_err(QKVNormError::BackendError)?;
         Ok(Head {
@@ -164,7 +165,6 @@ impl<B: Backend> QKVNorm<B> {
                 head.config.scale_offset.unwrap_or(0.0),
                 head_offset,
                 head_count,
-                head.config.upcast_mode == UpcastMode::FullLayer,
                 encoder,
             );
         }

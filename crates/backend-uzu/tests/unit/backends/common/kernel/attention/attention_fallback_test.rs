@@ -54,6 +54,7 @@ fn reference(
         HEAD_DIM,
         false,
         false,
+        false,
         true,
         false,
         false,
@@ -66,8 +67,13 @@ fn reference(
     let mut enc = Encoder::new(ctx.as_ref()).unwrap();
     kernel.encode(
         &qa,
-        &ka,
-        &va,
+        Some(&ka),
+        Some(&va),
+        None::<&Allocation<Cpu>>,
+        None::<&Allocation<Cpu>>,
+        None::<&Allocation<Cpu>>,
+        None::<&Allocation<Cpu>>,
+        None,
         &mut out,
         GQA,
         SEQ,

@@ -12,7 +12,11 @@ use crate::{
     },
     engine::Engine,
     parameters::{HeaderLoadingError, ParameterLoader, ParameterLoaderError},
-    speculators::dflash_tfm::{DFlashSpeculatorLoadError, DFlashTfmSpeculator},
+    speculators::{
+        Speculator,
+        dflash_tfm::{DFlashSpeculatorLoadError, DFlashTfmSpeculator},
+        prompt_lookup::PromptLookupSpeculator,
+    },
 };
 
 pub mod state;
@@ -24,7 +28,7 @@ pub mod grammar;
 pub struct LanguageModel<B: Backend> {
     engine: Arc<Engine<B>>,
     decoder: Decoder<B>,
-    speculator: Option<DFlashTfmSpeculator<B>>,
+    speculator: Option<Speculator<B>>,
     sampling: Sampling<B>,
     context_ring_update: <B::Kernels as Kernels>::ContextRingUpdateKernel,
     generation_config: GenerationConfig,
@@ -48,6 +52,15 @@ pub enum EngineLoadLanguageModelError<B: Backend> {
     Decoder(#[from] DecoderError<B>),
     #[error("Speculator error: {0}")]
     Speculator(#[from] DFlashSpeculatorLoadError<B>),
+}
+
+// Default-on since the ADR-11 gates passed (copy-heavy +83..+136%, chat
+// within -2%, long/sampled/qual checks bitwise-clean); UZU_PROMPT_LOOKUP=0
+// switches CPU prompt-lookup drafting off. Only reaches bf16 models with
+// tree-verify support and no shipped DFlash speculator.
+fn prompt_lookup_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("UZU_PROMPT_LOOKUP").map_or(true, |v| v != "0"))
 }
 
 impl<B: Backend> Engine<B> {
@@ -103,9 +116,16 @@ impl<B: Backend> Engine<B> {
             "attempted to load speculator for a model that doesn't support one"
         );
 
-        let speculator = speculator_path
-            .map(|speculator_path| DFlashTfmSpeculator::new(speculator_path, self.context.clone()))
-            .transpose()?;
+        let speculator = if let Some(speculator_path) = speculator_path {
+            Some(Speculator::DFlash(DFlashTfmSpeculator::new(speculator_path, self.context.clone())?))
+        } else if decoder.speculation_supported() && !weight_loader.has_integer_tensors() && prompt_lookup_enabled() {
+            // Quantized models stay out: their batched verification pass
+            // costs ~4x the single-token pass (dequant is ALU-bound, see
+            // ADR-11), which no realistic acceptance rate pays back.
+            Some(Speculator::PromptLookup(PromptLookupSpeculator::default()))
+        } else {
+            None
+        };
 
         let sampling = Sampling::new(data_type, config.decoder_config.vocab_size);
 

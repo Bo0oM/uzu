@@ -15,3 +15,6 @@ mod bench_cold_pool_test;
 
 #[path = "../../tests/unit/session/model_loading_bench.rs"]
 mod model_loading_bench;
+
+#[path = "../../tests/unit/session/device_decode_probe.rs"]
+mod device_decode_probe;

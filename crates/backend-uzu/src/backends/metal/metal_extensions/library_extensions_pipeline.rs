@@ -32,6 +32,6 @@ impl LibraryPipelineExtensions for ProtocolObject<dyn MTLLibrary> {
 
         device
             .new_compute_pipeline_state_with_function(&function)
-            .map_err(|nserror| MetalError::CannotCreatePipelineState(nserror.to_string()))
+            .map_err(|nserror| MetalError::CannotCreatePipelineState(format!("{function_name}: {nserror}")))
     }
 }

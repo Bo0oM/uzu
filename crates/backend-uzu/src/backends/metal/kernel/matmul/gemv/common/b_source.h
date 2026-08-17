@@ -11,15 +11,19 @@ template <
     typename BT,
     typename AT,
     typename U,
+    typename MT,
+    uint M_TILE,
     GemmBPrologueKind B_PROLOGUE,
     uint GROUP_SIZE,
     uint BITS,
+    uint VALUES_PER_THREAD,
+    uint PACKS,
     uint K_SPLIT,
     uint RESULTS_PER_SIMDGROUP,
     bool INPUT_ALIGNED>
 struct BSource {
   static METAL_FUNC void accumulate(
-      thread U (&result)[RESULTS_PER_SIMDGROUP],
+      thread U (&result)[M_TILE * RESULTS_PER_SIMDGROUP],
       const device uint32_t* b,
       const device BT* scales,
       const device uint8_t* zero_points,
@@ -36,7 +40,8 @@ struct BSource {
       const bool signed_codes
   ) {
     if constexpr (B_PROLOGUE == GemmBPrologueKind::FullPrecision) {
-      FullPrecisionBSource<BT, AT, U, RESULTS_PER_SIMDGROUP, K_SPLIT, INPUT_ALIGNED>::accumulate(
+      FullPrecisionBSource<BT, AT, U, M_TILE, VALUES_PER_THREAD, RESULTS_PER_SIMDGROUP, K_SPLIT, INPUT_ALIGNED>::
+          accumulate(
           result,
           b,
           a,
@@ -50,22 +55,24 @@ struct BSource {
           k_slice
       );
     } else {
-      QuantizedBSource<BT, AT, U, B_PROLOGUE, GROUP_SIZE, BITS, RESULTS_PER_SIMDGROUP, INPUT_ALIGNED>::accumulate(
-          result,
-          b,
-          scales,
-          zero_points,
-          biases,
-          a,
-          gather_indices,
-          gathered,
-          in_vec_size,
-          out_vec_size,
-          out_row,
-          batch_idx,
-          simd_lane,
-          signed_codes
-      );
+      QuantizedBSource<BT, AT, U, MT, M_TILE, B_PROLOGUE, GROUP_SIZE, BITS, PACKS, K_SPLIT, RESULTS_PER_SIMDGROUP, INPUT_ALIGNED>::
+          accumulate(
+              result,
+              b,
+              scales,
+              zero_points,
+              biases,
+              a,
+              gather_indices,
+              gathered,
+              in_vec_size,
+              out_vec_size,
+              out_row,
+              batch_idx,
+              simd_lane,
+              k_slice,
+              signed_codes
+          );
     }
   }
 };

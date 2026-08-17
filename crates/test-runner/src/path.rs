@@ -8,6 +8,21 @@ fn get_version() -> &'static str {
 }
 
 pub fn get_test_model_path() -> PathBuf {
+    // On-device runs (dinghy) ship the model inside the app bundle and point
+    // here; relative values resolve against the executable's directory.
+    if let Ok(dir) = std::env::var("UZU_TEST_MODEL_DIR") {
+        let mut path = PathBuf::from(&dir);
+        if path.is_relative()
+            && let Ok(exe) = std::env::current_exe()
+            && let Some(exe_dir) = exe.parent()
+        {
+            path = exe_dir.join(path);
+        }
+        if !path.exists() {
+            panic!("UZU_TEST_MODEL_DIR set but no model at {path:?}");
+        }
+        return path;
+    }
     let model_dir = std::env::var("TEST_MODEL").unwrap_or_else(|_| MODEL_DIR_NAME.to_string());
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")

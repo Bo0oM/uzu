@@ -22,6 +22,7 @@ struct Epilogue {
       uint out_block_idx,
       uint simd_group,
       uint simd_lane,
+      uint row_group,
       bool writer
   ) {
     const bool is_scale = output_transform.contains(GemmDTransform::SCALE);
@@ -52,10 +53,13 @@ struct Epilogue {
     }
 
     if (use_hadamard) {
-      if (simd_lane == 0) {
+      // The transform below consumes exactly one 32-row hadamard block laid
+      // out row-major in shared memory, so only writer slices stage their
+      // (fully reduced) rows, indexed by row group rather than simdgroup.
+      if (writer && simd_lane == 0) {
         METAL_PRAGMA_UNROLL
         for (uint row = 0; row < RESULTS_PER_SIMDGROUP; row++) {
-          shared_results[simd_group * RESULTS_PER_SIMDGROUP + row] = result[row];
+          shared_results[row_group * RESULTS_PER_SIMDGROUP + row] = result[row];
         }
       }
 

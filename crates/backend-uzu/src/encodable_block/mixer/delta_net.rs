@@ -212,9 +212,13 @@ impl<B: Backend> DeltaNet<B> {
         } else {
             None
         };
-        let conv_update =
-            <B::Kernels as Kernels>::DeltaNetConvUpdateKernel::new(context, outer_data_type, conv_config.has_biases)
-                .map_err(DeltaNetNewError::Backend)?;
+        let conv_update = <B::Kernels as Kernels>::DeltaNetConvUpdateKernel::new(
+            context,
+            outer_data_type,
+            conv_config.has_biases,
+            config.kernel_size,
+        )
+        .map_err(DeltaNetNewError::Backend)?;
         let conv_pack = <B::Kernels as Kernels>::Conv1dPackKernel::new(context, INNER_DATA_TYPE, outer_data_type)
             .map_err(DeltaNetNewError::Backend)?;
         let conv_scan =
@@ -508,7 +512,6 @@ impl<B: Backend> Mixer<B> for DeltaNet<B> {
                 self.conv_bias.as_ref(),
                 &mut in_projected,
                 &mut state.conv_state,
-                self.kernel_size,
                 self.conv_dim,
                 self.kernel_size - 1,
                 encoder,
@@ -518,7 +521,6 @@ impl<B: Backend> Mixer<B> for DeltaNet<B> {
                 &in_projected,
                 &self.a_log,
                 &self.dt_bias,
-                &self.norm_weight,
                 &mut state.ssm_state,
                 &mut delta_output,
                 self.num_heads,
@@ -526,7 +528,21 @@ impl<B: Backend> Mixer<B> for DeltaNet<B> {
                 self.value_head_dim,
                 self.key_dim,
                 self.value_dim,
+                // Split each head's dv range so decode fills the GPU.
+                (self.value_head_dim / 32).max(1),
+                encoder,
+            );
+            self.delta_net_norm_gate.encode(
+                &mut delta_output,
+                &in_projected,
+                &self.norm_weight,
+                self.num_heads,
+                self.value_head_dim,
+                self.value_dim,
+                self.conv_dim,
+                self.total_proj_dim,
                 self.norm_epsilon,
+                1,
                 encoder,
             );
         } else {

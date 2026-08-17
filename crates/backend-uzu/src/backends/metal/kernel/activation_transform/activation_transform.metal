@@ -10,7 +10,6 @@ using namespace uzu::activation_transform;
 
 UZU_CONST uint ACTIVATION_TILE_SIZE = 128;
 UZU_CONST uint SIMDGROUPS_PER_THREADGROUP = ACTIVATION_TILE_SIZE / METAL_SIMD_SIZE;
-UZU_CONST float INT8_QMAX = 127.0f;
 
 #define QUANTIZED (ops == ActivationTransformOp::Quantize || ops == ActivationTransformOp::QuantizeWithGroupSums)
 #define EMITS_GROUP_SUMS (ops == ActivationTransformOp::QuantizeWithGroupSums)

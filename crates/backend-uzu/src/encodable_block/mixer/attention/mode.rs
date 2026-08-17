@@ -11,7 +11,7 @@ use crate::{
             MixerState,
             attention::{
                 Attention,
-                core::AttentionCoreEncodeArguments,
+                core::{AttentionCoreEncodeArguments, AttentionKvQuant},
                 qkv_norm::QKVNorm,
                 rope::PrecalculatedRoPE,
                 state::{AttentionState, AttentionStateType},
@@ -63,11 +63,9 @@ impl<B: Backend> Attention<B> {
         let mut attention_output = match state {
             Some(MaybeMut::Mut(state)) => {
                 let qkv = self.qkv.project(hidden, batch_dim.size(), encoder)?;
-                let queries = self.prepare_kv_and_queries(
+                let queries = self.prepare_for_state(
                     &qkv,
-                    state.keys.as_mut(),
-                    state.values.as_mut(),
-                    state.state_type.physical_prefix_length(),
+                    state,
                     self.num_q_heads,
                     precalculated_rope,
                     batch_dim.size(),
@@ -126,6 +124,7 @@ impl<B: Backend> Attention<B> {
                         trie: None,
                         sinks: self.sinks.as_ref(),
                         state_type: &state_type,
+                        kv_quant: None,
                     },
                     encoder,
                 )?
@@ -154,16 +153,7 @@ impl<B: Backend> Attention<B> {
         if let Some(norm) = &self.qkv.norm {
             norm.encode_key_value(&mut key_value, batch_dim, encoder)?;
         }
-        self.prepare_kv_and_queries(
-            &key_value,
-            state.keys.as_mut(),
-            state.values.as_mut(),
-            state.state_type.physical_prefix_length(),
-            0,
-            Some(precalculated_rope),
-            batch_dim,
-            encoder,
-        )?;
+        self.prepare_for_state(&key_value, state, 0, Some(precalculated_rope), batch_dim, encoder)?;
         state.encode_accept(&(0..batch_dim).collect::<Box<[u32]>>(), encoder)?;
         Ok(())
     }
@@ -192,6 +182,10 @@ impl<B: Backend> Attention<B> {
                 trie: trie.as_ref(),
                 sinks: self.sinks.as_ref(),
                 state_type: &state.state_type,
+                kv_quant: state.kv_int8.then(|| AttentionKvQuant {
+                    key_scales: state.key_scales.as_ref().expect("int8 KV state requires key scales"),
+                    value_scales: state.value_scales.as_ref().expect("int8 KV state requires value scales"),
+                }),
             },
             encoder,
         )
@@ -218,6 +212,10 @@ impl<B: Backend> Attention<B> {
             &mut queries,
             Some(keys),
             Some(values),
+            None::<&mut Allocation<B>>,
+            None::<&mut Allocation<B>>,
+            None::<&mut Allocation<B>>,
+            None::<&mut Allocation<B>>,
             precalculated_rope.map(|precalculated_rope| &precalculated_rope.cosines),
             precalculated_rope.map(|precalculated_rope| &precalculated_rope.sines),
             num_q_heads,
@@ -245,6 +243,10 @@ impl<B: Backend> Attention<B> {
             &mut queries,
             None::<&mut Allocation<B>>,
             None::<&mut Allocation<B>>,
+            None::<&mut Allocation<B>>,
+            None::<&mut Allocation<B>>,
+            None::<&mut Allocation<B>>,
+            None::<&mut Allocation<B>>,
             precalculated_rope.map(|rope| &rope.cosines),
             precalculated_rope.map(|rope| &rope.sines),
             self.num_q_heads,
@@ -252,6 +254,61 @@ impl<B: Backend> Attention<B> {
             self.head_dim,
             precalculated_rope.map(|rope| rope.dim),
             None,
+            batch_dim,
+            encoder,
+        );
+        Ok(queries)
+    }
+
+    /// Prepares queries and writes the projected K/V into the state cache,
+    /// dispatching to the int8-quantizing kernel when the state is quantized.
+    fn prepare_for_state(
+        &self,
+        input: &Allocation<B>,
+        state: &mut AttentionState<B>,
+        num_q_heads: u32,
+        precalculated_rope: Option<&PrecalculatedRoPE<B>>,
+        batch_dim: u32,
+        encoder: &mut Encoder<B>,
+    ) -> Result<Allocation<B>, B::Error> {
+        let kv_int8 = state.kv_int8;
+        let kernel = if kv_int8 {
+            self.prepare_kv_q8.as_ref().expect("int8 KV state requires the q8 prepare kernel")
+        } else {
+            &self.prepare
+        };
+        let mut queries = if num_q_heads == 0 {
+            encoder.allocate_scratch(self.data_type.size_in_bytes())?
+        } else {
+            encoder.allocate_scratch_for_shape(&[self.num_q_heads, batch_dim, self.head_dim], self.data_type)?
+        };
+        let (keys, values) = (state.keys.as_mut(), state.values.as_mut());
+        let (keys_plain, keys_q8) = if kv_int8 {
+            (None, Some(keys))
+        } else {
+            (Some(keys), None)
+        };
+        let (values_plain, values_q8) = if kv_int8 {
+            (None, Some(values))
+        } else {
+            (Some(values), None)
+        };
+        kernel.encode(
+            input,
+            &mut queries,
+            keys_plain,
+            values_plain,
+            keys_q8,
+            values_q8,
+            state.key_scales.as_mut(),
+            state.value_scales.as_mut(),
+            precalculated_rope.map(|precalculated_rope| &precalculated_rope.cosines),
+            precalculated_rope.map(|precalculated_rope| &precalculated_rope.sines),
+            num_q_heads,
+            Some(self.num_kv_heads.expect("KV prepare requires KV heads")),
+            self.head_dim,
+            precalculated_rope.map(|precalculated_rope| precalculated_rope.dim),
+            Some(state.state_type.physical_prefix_length()),
             batch_dim,
             encoder,
         );

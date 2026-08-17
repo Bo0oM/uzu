@@ -3,7 +3,10 @@ use std::{
     sync::OnceLock,
 };
 
-use super::policy::{self, DEFAULT_RESULTS_PER_SIMDGROUP, FP_K_BLOCK};
+use super::{
+    autotune,
+    policy::{self, DEFAULT_FP_VALUES_PER_THREAD, DEFAULT_RESULTS_PER_SIMDGROUP},
+};
 use crate::{
     backends::{
         common::{
@@ -32,13 +35,19 @@ fn max_gemv_batch_threshold() -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct GemvSpecialization {
     b_prologue: GemmBPrologueKind,
+    /// Staging/multiply type of the quantized source (F16 on 2xFP16 tiers).
+    math: DataType,
     group_size: u32,
     bits: u32,
     output_transform: GemmDTransform,
     input_aligned: bool,
+    values_per_thread: u32,
     k_split: u32,
     results_per_simdgroup: u32,
     num_simdgroups: u32,
+    packs: u32,
+    /// Batch elements sharing one weight pass per threadgroup (1 = classic).
+    m_tile: u32,
     gathered: bool,
     signed_codes: bool,
 }
@@ -81,14 +90,26 @@ impl GemvSpecialization {
         }
 
         let bits = shape.b_bits.unwrap_or(0);
-        let block_size = if !is_quant {
-            FP_K_BLOCK
-        } else if bits == 4 {
-            512
+        let values_per_thread = if is_quant {
+            DEFAULT_FP_VALUES_PER_THREAD
         } else {
-            256
+            policy::fp_values_per_thread(shape.k, device_tier)
         };
-        let input_aligned = shape.k.is_multiple_of(block_size);
+        let group_size = shape.b_group_size.unwrap_or(0);
+        let tile_precheck_packs = if is_quant && bits == 4 && group_size == 64 {
+            None // resolved from the tile below
+        } else {
+            Some(2)
+        };
+        let input_aligned_for = |packs: u32| {
+            let block_size = if !is_quant {
+                policy::fp_k_block(values_per_thread)
+            } else {
+                // 32 lanes x packs words x (32 / bits) values per word.
+                32 * packs * (32 / bits)
+            };
+            shape.k.is_multiple_of(block_size)
+        };
         let has_rht = shape.d_transform.contains(GemmDTransform::RHT);
         let bf16_io = input_data_type == DataType::BF16 && output_data_type == DataType::BF16;
         let tile = if is_quant && bf16_io {
@@ -98,17 +119,67 @@ impl GemvSpecialization {
             // one instantiated for those modes).
             policy::DEFAULT_TILE
         } else {
-            policy::fp_tile(shape.m, shape.n, shape.k, input_aligned, device_tier)
+            // packs is irrelevant on the fp path; the closure ignores it there.
+            policy::fp_tile(shape.m, shape.n, shape.k, input_aligned_for(2), values_per_thread, device_tier)
+        };
+        // Mirrors the M_TILE constraint in gemv.metal: batched tiles exist
+        // for the dense-lane 4-bit gs64 and fp bf16 slices only, and the
+        // kernel's batch grid assumes m divides exactly into tiles.
+        let batched_slice_exists = if is_quant {
+            bits == 4 && group_size == 64
+        } else {
+            weights_data_type == DataType::BF16
+        };
+        let m_tile = if batched_slice_exists && bf16_io && !shape.gathered && !has_rht {
+            let selected = policy::gemv_m_tile(device_tier, shape.m, shape.n, shape.k, is_quant);
+            if selected == shape.m {
+                selected
+            } else {
+                1
+            }
+        } else {
+            1
+        };
+        let packs = if m_tile > 1 && is_quant {
+            1
+        } else {
+            tile_precheck_packs.unwrap_or(if tile.packs == 1 {
+                1
+            } else {
+                2
+            })
+        };
+        let input_aligned = input_aligned_for(packs);
+        // Mirrors the MT constraint in gemv.metal: only the 4-bit bf16
+        // gs32/gs64 slice has half pipelines instantiated.
+        let half_eligible = is_quant && bits == 4 && (group_size == 32 || group_size == 64) && bf16_io;
+        let math = if half_eligible
+            && policy::quant_half_math(device_tier, shape.m, shape.n, shape.k, group_size, input_aligned)
+        {
+            DataType::F16
+        } else {
+            DataType::F32
         };
         Some(Self {
             b_prologue: shape.b_prologue,
-            group_size: shape.b_group_size.unwrap_or(0),
+            math,
+            group_size,
             bits,
             output_transform: shape.d_transform,
             input_aligned,
-            k_split: tile.k_split,
+            values_per_thread,
+            // Batched quant tiles have no split variants; batched fp keeps
+            // split-K only on deep k (down k=6912 m=4: -19% at KS4), while
+            // shallow-k batched forms lose to it (upgate: 223 vs 102 us).
+            k_split: if m_tile > 1 && (is_quant || shape.k < 2048) {
+                1
+            } else {
+                tile.k_split
+            },
             results_per_simdgroup: tile.results_per_simdgroup,
             num_simdgroups: tile.num_simdgroups,
+            packs,
+            m_tile,
             gathered: shape.gathered,
             signed_codes: shape.signed_codes,
         })
@@ -157,13 +228,17 @@ impl GemvDispatch {
                     self.input_data_type,
                     self.weights_data_type,
                     self.output_data_type,
+                    specialization.math,
                     specialization.b_prologue,
                     specialization.group_size,
                     specialization.bits,
+                    specialization.values_per_thread,
+                    specialization.packs,
                     specialization.k_split,
                     specialization.input_aligned,
                     specialization.results_per_simdgroup,
                     specialization.num_simdgroups,
+                    specialization.m_tile,
                     specialization.output_transform,
                     specialization.gathered,
                     specialization.signed_codes,
@@ -231,7 +306,7 @@ impl GemvDispatch {
                     gather_indices,
                     k,
                     n,
-                    m,
+                    m / specialization.m_tile,
                     ab_scale,
                     group_count_x,
                     soft_cap,
@@ -281,15 +356,135 @@ impl GemvDispatch {
                     gather_indices,
                     k,
                     n,
-                    m,
+                    m / specialization.m_tile,
                     ab_scale,
                     group_count_x,
                     soft_cap,
                     encoder,
                 );
+
+                // First-launch tile calibration: on the first sight of a
+                // quantized decode shape, time the candidate tiles on these
+                // same buffers and install the winner for all later
+                // dispatches (and launches, via the on-disk cache). The
+                // dispatch above already ran with the shipped default, so
+                // decoding is never blocked on calibration.
+                if m == 1
+                    && !specialization.gathered
+                    && specialization.bits != 0
+                    && autotune::needs_calibration(context, n, k, specialization.group_size, specialization.bits)
+                {
+                    self.calibrate(
+                        context,
+                        &specialization,
+                        weights,
+                        scales,
+                        zero_points,
+                        biases,
+                        (a, a_offset),
+                        &mut *d,
+                        output_bias,
+                        rht_factors,
+                        k,
+                        n,
+                        ab_scale,
+                        soft_cap,
+                    );
+                }
             },
         }
 
         Ok(())
+    }
+
+    /// Times the candidate tiles for one quantized decode shape and records
+    /// the winner (policy override + on-disk cache). Runs once per shape per
+    /// device on the caller's live buffers, so the measured dispatches match
+    /// production exactly; the output buffer is scratch here — the caller's
+    /// real dispatch already produced its result.
+    #[allow(clippy::too_many_arguments)]
+    fn calibrate<'b, TB: BufferArg<'b, Metal>>(
+        &mut self,
+        context: &MetalContext,
+        base: &GemvSpecialization,
+        weights: TB,
+        scales: &Allocation<Metal>,
+        zero_points: Option<&Allocation<Metal>>,
+        biases: Option<&Allocation<Metal>>,
+        a: (&Allocation<Metal>, usize),
+        d: &mut Allocation<Metal>,
+        output_bias: Option<&Allocation<Metal>>,
+        rht_factors: Option<&Allocation<Metal>>,
+        k: u32,
+        n: u32,
+        ab_scale: f32,
+        soft_cap: Option<f32>,
+    ) {
+        let has_rht = base.output_transform.contains(GemmDTransform::RHT);
+        let fitted = policy::GemvTile {
+            num_simdgroups: base.num_simdgroups,
+            k_split: base.k_split,
+            results_per_simdgroup: base.results_per_simdgroup,
+            packs: base.packs,
+        };
+        let mut best: Option<(policy::GemvTile, std::time::Duration)> = None;
+        for tile in autotune::candidates(base.group_size, base.bits, fitted) {
+            let rows = (tile.num_simdgroups / tile.k_split) * tile.results_per_simdgroup;
+            if n < tile.results_per_simdgroup || (has_rht && rows != 32) {
+                continue;
+            }
+            let block = 32 * tile.packs * (32 / base.bits);
+            let candidate = GemvSpecialization {
+                input_aligned: k.is_multiple_of(block),
+                k_split: tile.k_split,
+                results_per_simdgroup: tile.results_per_simdgroup,
+                num_simdgroups: tile.num_simdgroups,
+                packs: tile.packs,
+                ..*base
+            };
+            let group_count_x = n.div_ceil(rows_per_threadgroup(
+                candidate.k_split,
+                candidate.results_per_simdgroup,
+                candidate.num_simdgroups,
+            ));
+            let Ok(mut encoder) = Encoder::<Metal>::new(context) else {
+                break;
+            };
+            if self.get_or_create(context, candidate).is_err() {
+                continue;
+            }
+            let pipeline = self.pipelines.get(&candidate).expect("pipeline just inserted");
+            for _ in 0..autotune::ITERATIONS_PER_CANDIDATE {
+                pipeline.encode(
+                    weights,
+                    Some(scales),
+                    zero_points,
+                    biases,
+                    a,
+                    &mut *d,
+                    output_bias,
+                    rht_factors,
+                    None::<&Allocation<Metal>>,
+                    k,
+                    n,
+                    1,
+                    ab_scale,
+                    group_count_x,
+                    soft_cap,
+                    &mut encoder,
+                );
+            }
+            let Ok(completed) = encoder.end_encoding().submit().wait_until_completed() else {
+                continue;
+            };
+            let elapsed = completed.gpu_execution_time();
+            if best.as_ref().is_none_or(|(_, best_time)| elapsed < *best_time) {
+                best = Some((tile, elapsed));
+            }
+        }
+        match best {
+            Some((winner, _)) => autotune::record_winner(context, n, k, base.group_size, base.bits, winner),
+            None => autotune::mark_resolved(context, n, k, base.group_size, base.bits),
+        }
     }
 }

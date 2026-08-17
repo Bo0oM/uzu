@@ -45,8 +45,11 @@ impl<B: Backend> LanguageModel<B> {
         let speculator_state = self
             .speculator
             .as_ref()
-            .map(|speculator| {
-                speculator.empty_state(max_context_length.expect("speculator doesn't support unlimited state capacity"))
+            .and_then(|speculator| match speculator {
+                crate::speculators::Speculator::DFlash(speculator) => Some(speculator.empty_state(
+                    max_context_length.expect("speculator doesn't support unlimited state capacity"),
+                )),
+                crate::speculators::Speculator::PromptLookup(_) => None,
             })
             .transpose()
             .map_err(LanguageModelCreateEmptyStateError::Backend)?;

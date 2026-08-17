@@ -118,3 +118,13 @@ inline uint philox_next(thread PhiloxState* state) {
 inline float uniform_float(thread PhiloxState* state) {
   return float(metal::max(philox_next(state) >> 8, 1u)) * (1.0f / 16777216.0f);
 }
+
+/* One philox block covers 4 consecutive logits: the gumbel noise of logit e is
+ * a pure function of (seed, counter = e / 4, word = e % 4), independent of any
+ * grid layout. The CPU mirror is `revidx` in encodable_block/sampling/gumbel.rs;
+ * the sampling and weaver kernels must all draw through this mapping. */
+#define GUMBEL_ELEMS_PER_NOISE_BLOCK 4
+
+inline uint2 gumbel_noise_coords(uint logit_idx) {
+  return uint2(logit_idx / GUMBEL_ELEMS_PER_NOISE_BLOCK, logit_idx % GUMBEL_ELEMS_PER_NOISE_BLOCK);
+}

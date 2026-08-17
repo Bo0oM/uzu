@@ -4,7 +4,13 @@ use proc_macros::kernel;
 
 use crate::{
     array::ArrayElement,
-    backends::{common::gpu_types::trie::TrieNode, cpu::kernel::attention::mask::should_use_key},
+    backends::{
+        common::gpu_types::trie::TrieNode,
+        cpu::kernel::attention::{
+            kv_row::{KvRowSource, read_kv_row},
+            mask::should_use_key,
+        },
+    },
 };
 
 #[kernel(AttentionSinglePass)]
@@ -12,8 +18,13 @@ use crate::{
 #[variants(HEAD_DIM, 64, 128, 256, 512)]
 pub fn attention_single_pass<T: ArrayElement + Float, const HEAD_DIM: u32>(
     queries: *const T,
-    keys: *const T,
-    values: *const T,
+    #[optional(!kv_int8)] keys: Option<*const T>,
+    #[optional(!kv_int8)] values: Option<*const T>,
+    #[optional(kv_int8)] keys_q8: Option<*const i8>,
+    #[optional(kv_int8)] values_q8: Option<*const i8>,
+    #[optional(kv_int8)] key_scales: Option<*const f32>,
+    #[optional(kv_int8)] value_scales: Option<*const f32>,
+    #[optional(kv_int8)] num_kv_heads: Option<u32>,
     out: *mut T,
     gqa_factor: u32,
     sequence_length: u32,
@@ -29,6 +40,7 @@ pub fn attention_single_pass<T: ArrayElement + Float, const HEAD_DIM: u32>(
     num_heads: u32,
     suffix_length: u32,
     #[specialize] has_sinks: bool,
+    #[specialize] kv_int8: bool,
     #[specialize] is_kv_cache_ring: bool,
     #[specialize] is_causal: bool,
     #[specialize] is_trie: bool,
@@ -60,13 +72,33 @@ pub fn attention_single_pass<T: ArrayElement + Float, const HEAD_DIM: u32>(
             };
 
             let queries: *const T = unsafe { queries.add((q_offset * HEAD_DIM) as usize) };
-            let keys: *const T = unsafe { keys.add((kv_head_idx * k_head_stride) as usize) };
-            let values: *const T = unsafe { values.add((kv_head_idx * v_head_stride) as usize) };
             let out: *mut T = unsafe { out.add((o_offset * value_dim) as usize) };
+            let key_source = KvRowSource {
+                int8_base: keys_q8,
+                float_base: keys,
+                scales: key_scales,
+                kv_int8,
+                num_kv_heads,
+                kv_head_idx,
+                head_stride: k_head_stride,
+                seq_stride: k_seq_stride,
+            };
+            let value_source = KvRowSource {
+                int8_base: values_q8,
+                float_base: values,
+                scales: value_scales,
+                kv_int8,
+                num_kv_heads,
+                kv_head_idx,
+                head_stride: v_head_stride,
+                seq_stride: v_seq_stride,
+            };
 
             // Read the query and 0 the output accumulator
             let mut q = vec![0.0f32; HEAD_DIM as usize];
             let mut o = vec![0.0f32; HEAD_DIM as usize];
+            let mut key_row = vec![0.0f32; HEAD_DIM as usize];
+            let mut value_row = vec![0.0f32; HEAD_DIM as usize];
             for j in 0..HEAD_DIM as usize {
                 q[j] = scale * unsafe { *queries.add(j) }.to_f32().unwrap();
             }
@@ -92,12 +124,12 @@ pub fn attention_single_pass<T: ArrayElement + Float, const HEAD_DIM: u32>(
                     i,
                     is_causal,
                 ) {
-                    let keys = unsafe { keys.add((i * k_seq_stride) as usize) };
+                    read_kv_row(&key_source, i, &mut key_row);
 
                     // Compute the i-th score
                     let mut score = 0.0f32;
                     for j in 0..HEAD_DIM as usize {
-                        score += q[j] * unsafe { *keys.add(j) }.to_f32().unwrap();
+                        score += q[j] * key_row[j];
                     }
 
                     // Update the accumulators
@@ -109,9 +141,9 @@ pub fn attention_single_pass<T: ArrayElement + Float, const HEAD_DIM: u32>(
                     sum_exp_score = sum_exp_score * factor + exp_score;
 
                     // Update the output accumulator
-                    let values = unsafe { values.add((i * v_seq_stride) as usize) };
+                    read_kv_row(&value_source, i, &mut value_row);
                     for j in 0..HEAD_DIM as usize {
-                        o[j] = o[j] * factor + exp_score * unsafe { *values.add(j) }.to_f32().unwrap();
+                        o[j] = o[j] * factor + exp_score * value_row[j];
                     }
                 }
             }

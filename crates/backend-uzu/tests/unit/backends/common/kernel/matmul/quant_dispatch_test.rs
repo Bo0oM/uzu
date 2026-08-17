@@ -113,6 +113,12 @@ fn run_parity<T: ArrayElement + Float + Debug + Display>(
 #[case::gs32_narrow_n_tail_mlx(64, 256, 72, 32, 4, QuantizationMethod::ScaleBias)]
 #[case::gs32_narrow_n_tail_sym(64, 256, 40, 32, 4, QuantizationMethod::ScaleSymmetric)]
 #[case::gs16_k_tail_mlx(64, 272, 64, 16, 4, QuantizationMethod::ScaleBias)]
+// Row-unaligned M tiles exercise the clamped A loads of the simdgroup core
+// (uzu-nzk): every tile is partial in rows, none may read out of bounds or
+// store garbage rows.
+#[case::m4_gs32_gemm_rows_unaligned(4, 256, 64, 32, 4, QuantizationMethod::ScaleBias)]
+#[case::m5_gs32_gemm_rows_unaligned(5, 256, 64, 32, 4, QuantizationMethod::ScaleZeroPoint)]
+#[case::m4_gs64_gemm_k_tail(4, 272, 96, 16, 4, QuantizationMethod::ScaleBias)]
 fn parity_bf16(
     #[case] m: u32,
     #[case] k: u32,
@@ -151,10 +157,24 @@ fn parity_bf16_8bit_splitk(
 #[case::m1_gs128_8bit_mlx(1, 256, 64, 128, 8, QuantizationMethod::ScaleBias)]
 #[case::m1_gs32_4bit_sym(1, 256, 64, 32, 4, QuantizationMethod::ScaleSymmetric)]
 #[case::m1_gs64_8bit_sym(1, 256, 64, 64, 8, QuantizationMethod::ScaleSymmetric)]
+// Deep-k decode shapes: enough complete 512-value K blocks for split-K
+// tiles, with both aligned k and a partial tail block.
+#[case::m1_deep_k_tail_zp(1, 1152, 96, 32, 4, QuantizationMethod::ScaleZeroPoint)]
+#[case::m1_deep_k_tail_mlx(1, 6912, 72, 64, 4, QuantizationMethod::ScaleBias)]
+#[case::m1_deep_k_aligned_zp(1, 4096, 64, 32, 4, QuantizationMethod::ScaleZeroPoint)]
+#[case::m1_deep_k_aligned_sym(1, 1024, 64, 64, 4, QuantizationMethod::ScaleSymmetric)]
 #[case::m2_gs32_4bit_mlx(2, 256, 64, 32, 4, QuantizationMethod::ScaleBias)]
 #[case::m4_gs32_4bit_zp(4, 256, 64, 32, 4, QuantizationMethod::ScaleZeroPoint)]
 #[case::m8_gs32_4bit_zp(8, 256, 64, 32, 4, QuantizationMethod::ScaleZeroPoint)]
 #[case::m8_gs32_4bit_mlx(8, 256, 64, 32, 4, QuantizationMethod::ScaleBias)]
+// gs64 batch shapes double as the batched-tile parity gate: with
+// UZU_GEMV_M_TILE=4|8 these dispatch the M_TILE kernel (aligned, k-tail,
+// and sub-R n-tail), without it the classic per-element grid.
+#[case::m4_gs64_4bit_mlx_aligned(4, 512, 64, 64, 4, QuantizationMethod::ScaleBias)]
+#[case::m4_gs64_4bit_mlx_k_tail(4, 1152, 96, 64, 4, QuantizationMethod::ScaleBias)]
+#[case::m8_gs64_4bit_mlx_k_tail(8, 1152, 72, 64, 4, QuantizationMethod::ScaleBias)]
+#[case::m8_gs64_4bit_mlx_deep(8, 6912, 64, 64, 4, QuantizationMethod::ScaleBias)]
+#[case::m8_gs64_4bit_sym(8, 512, 64, 64, 4, QuantizationMethod::ScaleSymmetric)]
 fn parity_gemv_bf16(
     #[case] m: u32,
     #[case] k: u32,
@@ -345,11 +365,15 @@ fn parity_bf16_gemv_quant_rht_with_bias() {
     assert_parity::<bf16>("gemv_quant_rht_bias", &reference, &actual, 0.05, 0.6);
 }
 
-#[uzu_test]
-fn parity_bf16_gemv_quant_rht() {
+#[rstest]
+#[test_attr(uzu_test)]
+#[case::shallow_k(256)]
+// Deep enough for split-K tiles (two complete 512-value blocks plus a tail).
+#[case::deep_k_tail(1152)]
+fn parity_bf16_gemv_quant_rht(#[case] k: u32) {
     let context = MetalContext::new().expect("Metal context");
     // n % 32 == 0 so the output RHT covers whole 32-element blocks; m = 1 routes to GEMV.
-    let input = QuantInput::<bf16>::new(1, 256, 64, 32, 4, QuantizationMethod::ScaleBias, 0);
+    let input = QuantInput::<bf16>::new(1, k, 64, 32, 4, QuantizationMethod::ScaleBias, 0);
     let rht: Vec<i32> = (0..input.n as usize)
         .map(|i| {
             if i % 2 == 0 {

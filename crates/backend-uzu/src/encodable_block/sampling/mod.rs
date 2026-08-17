@@ -187,7 +187,7 @@ impl<B: Backend> Sampling<B> {
             self.vocab_size,
             sampling_length,
             encoder,
-        );
+        )?;
 
         encoder.pop_debug_group();
 

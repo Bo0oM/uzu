@@ -98,6 +98,30 @@ const QWEN3_LAYERS: &[(&str, u32, u32)] = &[
     ("4b_in", 2560, 12352),
 ];
 
+// gemma-3-1b decode projections (MLX 4-bit ships as ScaleBias gs64). The k
+// values are deliberately not block-aligned — that is the production path,
+// which the aligned-only qwen3 filter would drop.
+const GEMMA3_1B_LAYERS: &[(&str, u32, u32)] = &[
+    ("g1b_qkv", 1152, 1536),
+    ("g1b_o", 1024, 1152),
+    ("g1b_upgate", 1152, 13824),
+    ("g1b_down", 6912, 1152),
+    ("g1b_readout", 1152, 262144),
+];
+
+pub fn gemma3_layer_shapes() -> impl Iterator<Item = (&'static str, Shape)> {
+    GEMMA3_1B_LAYERS.iter().map(|&(label, k, n)| (label, Shape::new(1, k, n)))
+}
+
+/// The same production forms at draft-verification batch sizes: the cost
+/// ratio to m = 1 decides whether speculative decode can pay for itself.
+pub fn gemma3_batched_layer_shapes() -> impl Iterator<Item = (&'static str, Shape)> {
+    let ms = &[1u32, 4, 8];
+    GEMMA3_1B_LAYERS
+        .iter()
+        .flat_map(move |&(label, k, n)| ms.iter().map(move |&m| (label, Shape::new(m, k, n))))
+}
+
 pub fn qwen3_layer_shapes(bits: u32) -> impl Iterator<Item = (&'static str, Shape)> {
     let block_size: u32 = if bits == 4 {
         512

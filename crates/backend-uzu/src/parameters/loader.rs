@@ -125,6 +125,27 @@ impl<'a, B: Backend> ParameterLoader<'a, B> {
         })
     }
 
+    /// Whether any tensor ships in an integer dtype. The safetensors header
+    /// is the source of truth for quantization — config.json shows an empty
+    /// quantization block even for quantized exports.
+    pub fn has_integer_tensors(&self) -> bool {
+        self.index.values().any(|metadata| {
+            matches!(
+                metadata.data_type,
+                DataType::I4
+                    | DataType::U4
+                    | DataType::I8
+                    | DataType::U8
+                    | DataType::I16
+                    | DataType::U16
+                    | DataType::I32
+                    | DataType::U32
+                    | DataType::I64
+                    | DataType::U64
+            )
+        })
+    }
+
     pub fn tree(&self) -> ParameterTree<'_, B> {
         ParameterTree {
             loader: self,

@@ -36,20 +36,12 @@ fn run_conv_update<B: Backend>(
     let mut in_out = alloc_allocation_with_data::<B, f32>(&context, in_proj);
     let mut state_allocation = alloc_allocation_with_data::<B, f32>(&context, state);
 
-    let kernel = <<B as Backend>::Kernels as Kernels>::DeltaNetConvUpdateKernel::new(&context, DataType::F32, true)
-        .expect("Failed to create kernel");
+    let kernel =
+        <<B as Backend>::Kernels as Kernels>::DeltaNetConvUpdateKernel::new(&context, DataType::F32, true, kernel_size)
+            .expect("Failed to create kernel");
 
     let mut encoder = Encoder::new(context.as_ref()).expect("Failed to create encoder");
-    kernel.encode(
-        &w_array,
-        Some(&b_array),
-        &mut in_out,
-        &mut state_allocation,
-        kernel_size,
-        conv_dim,
-        state_stride,
-        &mut encoder,
-    );
+    kernel.encode(&w_array, Some(&b_array), &mut in_out, &mut state_allocation, conv_dim, state_stride, &mut encoder);
     encoder.end_encoding().submit().wait_until_completed().unwrap();
 
     let out = allocation_prefix_to_vec::<B, f32>(&in_out, conv_dim as usize);
@@ -72,10 +64,11 @@ fn run_delta_net_update<B: Backend>(
 ) -> (Vec<f32>, Vec<f32>) {
     let context = B::Context::new().expect("Failed to create context");
 
+    // norm_weight is unused since RMSNorm+gate moved to the DeltaNetNormGate pass.
+    let _ = norm_weight;
     let in_proj_array = alloc_allocation_with_data::<B, f32>(&context, in_proj);
     let a_log_array = alloc_allocation_with_data::<B, f32>(&context, a_log);
     let dt_bias_array = alloc_allocation_with_data::<B, f32>(&context, dt_bias);
-    let norm_weight_array = alloc_allocation_with_data::<B, f32>(&context, norm_weight);
     let mut state_allocation = alloc_allocation_with_data::<B, f32>(&context, state);
     let mut out = alloc_allocation::<B, f32>(&context, value_dim as usize);
 
@@ -83,11 +76,15 @@ fn run_delta_net_update<B: Backend>(
         .expect("Failed to create kernel");
 
     let mut encoder = Encoder::new(context.as_ref()).expect("Failed to create encoder");
+    let dv_blocks = if head_v_dim.is_multiple_of(2) {
+        2
+    } else {
+        1
+    };
     kernel.encode(
         &in_proj_array,
         &a_log_array,
         &dt_bias_array,
-        &norm_weight_array,
         &mut state_allocation,
         &mut out,
         num_v_heads,
@@ -95,7 +92,7 @@ fn run_delta_net_update<B: Backend>(
         head_v_dim,
         key_dim,
         value_dim,
-        1e-6f32,
+        dv_blocks,
         &mut encoder,
     );
     encoder.end_encoding().submit().wait_until_completed().unwrap();
@@ -451,7 +448,20 @@ fn test_prefill_norm_gate_impl<T: ArrayElement>(
             value_dim as u32,
         );
         ref_state = new_state;
-        ref_outputs[token_index * value_dim..(token_index + 1) * value_dim].copy_from_slice(&out);
+        // The update kernel now returns raw outputs; apply the NormGate math
+        // (RMSNorm + SiLU gate) host-side to match the prefill pipeline.
+        let mut normed = out;
+        for hv in 0..num_v_heads {
+            let head = &mut normed[hv * head_v_dim..(hv + 1) * head_v_dim];
+            let sumsq: f32 = head.iter().map(|x| x * x).sum();
+            let inv_rms = 1.0 / (sumsq / head_v_dim as f32 + 1e-6).sqrt();
+            for (dv, value) in head.iter_mut().enumerate() {
+                let z = token_in[conv_dim + hv * head_v_dim + dv];
+                let z_silu = z / (1.0 + (-z).exp());
+                *value *= inv_rms * norm_weight[dv] * z_silu;
+            }
+        }
+        ref_outputs[token_index * value_dim..(token_index + 1) * value_dim].copy_from_slice(&normed);
     }
 
     let (gpu_out, gpu_state) = run_prefill_with_norm_gate_typed(

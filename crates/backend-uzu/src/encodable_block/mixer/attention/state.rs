@@ -13,6 +13,23 @@ use crate::{
 
 pub(crate) const ATTENTION_SUFFIX_CAPACITY: u32 = 1024; // TODO: remove hardcoded suffix capacity
 
+/// Head dims above one 256-thread group cannot reduce their absmax inside
+/// the prepare kernel, so they keep the bf16 cache.
+pub(crate) const KV_INT8_MAX_HEAD_DIM: u32 = 256;
+
+/// Opt-in int8 KV cache (symmetric absmax per (token, kv head)); see ADR-8.
+pub(crate) fn kv_int8_eligible(
+    head_dim: u32,
+    data_type: DataType,
+) -> bool {
+    kv_cache_int8_enabled() && head_dim <= KV_INT8_MAX_HEAD_DIM && matches!(data_type, DataType::BF16 | DataType::F16)
+}
+
+pub(crate) fn kv_cache_int8_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("UZU_KV_INT8").is_some())
+}
+
 pub enum AttentionStateType {
     Full {
         length: u32,
@@ -61,8 +78,12 @@ pub struct AttentionState<B: Backend> {
     pub data_type: DataType,
     pub state_type: AttentionStateType,
     pub is_sparse: bool,
+    pub kv_int8: bool,
+    pub num_kv_heads: u32,
     pub keys: Box<dyn Buffer<Backend = B>>,
     pub values: Box<dyn Buffer<Backend = B>>,
+    pub key_scales: Option<B::DenseBuffer>,
+    pub value_scales: Option<B::DenseBuffer>,
     pub kv_cache_update: <B::Kernels as Kernels>::KVCacheUpdateKernel,
 }
 
@@ -106,8 +127,15 @@ impl<B: Backend> AttentionState<B> {
         };
 
         let max_elements = max_prefix_elements + ATTENTION_SUFFIX_CAPACITY;
-        let element_size = attention.num_kv_heads.unwrap() * attention.head_dim;
-        let kv_buffer_bytes = size_for_shape(&[max_elements, element_size], data_type);
+        let num_kv_heads = attention.num_kv_heads.unwrap();
+        let element_size = num_kv_heads * attention.head_dim;
+        let kv_int8 = kv_int8_eligible(attention.head_dim, data_type);
+        let cache_data_type = if kv_int8 {
+            DataType::U8
+        } else {
+            data_type
+        };
+        let kv_buffer_bytes = size_for_shape(&[max_elements, element_size], cache_data_type);
 
         let is_ring = matches!(state_type, AttentionStateType::Ring { .. });
         let is_sparse = !is_ring && context.device_capabilities().contains(DeviceCapabilities::SPARSE_BUFFERS);
@@ -121,17 +149,28 @@ impl<B: Backend> AttentionState<B> {
             (Box::new(context.create_buffer(kv_buffer_bytes)?), Box::new(context.create_buffer(kv_buffer_bytes)?))
         };
 
+        let (key_scales, value_scales) = if kv_int8 {
+            let scale_bytes = size_for_shape(&[max_elements, num_kv_heads], DataType::F32);
+            (Some(context.create_buffer(scale_bytes)?), Some(context.create_buffer(scale_bytes)?))
+        } else {
+            (None, None)
+        };
+
         let kv_cache_update = <B::Kernels as Kernels>::KVCacheUpdateKernel::new(context, data_type)?;
 
         Ok(Self {
             cur_context_length: 0,
             elements_prepared: 0,
             element_dim: element_size,
-            data_type,
+            data_type: cache_data_type,
             state_type,
             is_sparse,
+            kv_int8,
+            num_kv_heads,
             keys,
             values,
+            key_scales,
+            value_scales,
             kv_cache_update,
         })
     }
@@ -219,15 +258,33 @@ impl<B: Backend> MixerState<B> for AttentionState<B> {
             },
         };
 
+        // The copy kernel is typed by the model dtype; the int8 cache rows are
+        // the same bytes viewed as half as many of those elements, and the f32
+        // scale rows move in a second pass over the scale buffers.
+        let copy_element_dim = if self.kv_int8 {
+            self.element_dim / 2
+        } else {
+            self.element_dim
+        };
         for copies_chunk in copies.chunks(B::MAX_INLINE_BYTES / size_of::<Copy>()) {
             self.kv_cache_update.encode(
                 self.keys.as_mut(),
                 self.values.as_mut(),
                 copies_chunk,
                 copies_chunk.len() as u32,
-                self.element_dim,
+                copy_element_dim,
                 encoder,
             );
+            if let (Some(key_scales), Some(value_scales)) = (&mut self.key_scales, &mut self.value_scales) {
+                self.kv_cache_update.encode(
+                    &mut *key_scales,
+                    &mut *value_scales,
+                    copies_chunk,
+                    copies_chunk.len() as u32,
+                    self.num_kv_heads * 2,
+                    encoder,
+                );
+            }
         }
 
         self.cur_context_length += accepted_indices.len() as u32;

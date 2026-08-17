@@ -24,6 +24,6 @@ pub use command_buffer::{
 };
 pub use context::Context;
 pub use device_capabilities::DeviceCapabilities;
-pub use encoder::{Completed, Encoder, Executable, Pending};
+pub use encoder::{Completed, Encoder, Executable, Pending, gpu_trace_snapshot};
 pub use hazard_tracker::Access;
 pub use kernel::Kernels;

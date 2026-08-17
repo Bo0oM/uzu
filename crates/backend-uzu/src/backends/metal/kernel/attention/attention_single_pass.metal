@@ -1,5 +1,6 @@
 #include <metal_stdlib>
 #include <metal_simdgroup>
+#include "../common/defines.h"
 #include "../common/dsl.h"
 #include "../common/thread_context.h"
 #include "../generated/ring.h"
@@ -17,8 +18,13 @@ VARIANTS(T, float, half, bfloat)
 VARIANTS(HEAD_DIM, 64, 128, 256, 512)
 PUBLIC KERNEL(AttentionSinglePass)(
     const device T* queries,
-    const device T* keys,
-    const device T* values,
+    const device T* keys OPTIONAL(!kv_int8),
+    const device T* values OPTIONAL(!kv_int8),
+    const device char* keys_q8 OPTIONAL(kv_int8),
+    const device char* values_q8 OPTIONAL(kv_int8),
+    const device float* key_scales OPTIONAL(kv_int8),
+    const device float* value_scales OPTIONAL(kv_int8),
+    const constant uint& num_kv_heads OPTIONAL(kv_int8),
     device T* out,
     const constant uint& gqa_factor,
     const constant uint& sequence_length,
@@ -37,6 +43,7 @@ PUBLIC KERNEL(AttentionSinglePass)(
     threadgroup float shared_sum_exp_scores[SEQUENCE_BLOCK_SIZE * HEAD_BLOCK_SIZE],
     threadgroup float shared_outputs[SEQUENCE_BLOCK_SIZE * HEAD_BLOCK_SIZE],
     const bool has_sinks SPECIALIZE,
+    const bool kv_int8 SPECIALIZE,
     const bool is_kv_cache_ring SPECIALIZE,
     const bool is_causal SPECIALIZE,
     const bool is_trie SPECIALIZE,
@@ -51,13 +58,18 @@ PUBLIC KERNEL(AttentionSinglePass)(
   constexpr uint value_dim = HEAD_DIM;
   constexpr uint qk_elements_per_thread = HEAD_DIM / HEAD_BLOCK_SIZE;
   constexpr uint value_elements_per_thread = value_dim / HEAD_BLOCK_SIZE;
+  // Width 4 pays off, width 2 measurably regresses, so narrower head dims stay scalar via width 1.
+  // KV strides are head_dim multiples (core/single_pass.rs), which is what makes the wide load aligned.
+  constexpr uint LOAD_WIDTH = qk_elements_per_thread >= 4 ? 4 : 1;
+  constexpr uint KV_LOAD_COUNT = qk_elements_per_thread / LOAD_WIDTH;
+  static_assert(HEAD_DIM % (HEAD_BLOCK_SIZE * LOAD_WIDTH) == 0, "head-dim must split into aligned KV vectors");
+  typedef vec<T, LOAD_WIDTH> KVVec;
   uint inner_k_stride = SEQUENCE_BLOCK_SIZE * int(k_seq_stride);
   uint inner_v_stride = SEQUENCE_BLOCK_SIZE * int(v_seq_stride);
 
   typedef float U;
 
   thread U q[qk_elements_per_thread];
-  thread U k[qk_elements_per_thread];
   thread U o[value_elements_per_thread];
 
   const uint kv_head_idx = head_idx / gqa_factor;
@@ -71,10 +83,19 @@ PUBLIC KERNEL(AttentionSinglePass)(
   const uint query_position = is_trie ? suffix_position + trie[q_seq_idx].height : suffix_position + q_seq_idx;
 
   queries += q_offset * HEAD_DIM + thread_context.simd_lane_id * qk_elements_per_thread;
-  keys += kv_head_idx * k_head_stride + thread_context.simdgroup_index * k_seq_stride +
-          thread_context.simd_lane_id * qk_elements_per_thread;
-  values += kv_head_idx * v_head_stride + thread_context.simdgroup_index * v_seq_stride +
-            thread_context.simd_lane_id * value_elements_per_thread;
+  if (kv_int8) {
+    keys_q8 += kv_head_idx * k_head_stride + thread_context.simdgroup_index * k_seq_stride +
+               thread_context.simd_lane_id * qk_elements_per_thread;
+    values_q8 += kv_head_idx * v_head_stride + thread_context.simdgroup_index * v_seq_stride +
+                 thread_context.simd_lane_id * value_elements_per_thread;
+    key_scales += kv_head_idx;
+    value_scales += kv_head_idx;
+  } else {
+    keys += kv_head_idx * k_head_stride + thread_context.simdgroup_index * k_seq_stride +
+            thread_context.simd_lane_id * qk_elements_per_thread;
+    values += kv_head_idx * v_head_stride + thread_context.simdgroup_index * v_seq_stride +
+              thread_context.simd_lane_id * value_elements_per_thread;
+  }
 
   out += o_offset * value_dim + thread_context.simdgroup_index * value_elements_per_thread;
 
@@ -111,15 +132,25 @@ PUBLIC KERNEL(AttentionSinglePass)(
             is_trie,
             is_sliding_window
         )) {
-      // Read the key
-      for (uint j = 0; j < qk_elements_per_thread; j++) {
-        k[j] = keys[j];
-      }
-
-      // Compute the i-th score
+      // Compute the i-th score straight off the loaded vector
       U score = 0;
-      for (uint j = 0; j < qk_elements_per_thread; j++) {
-        score += q[j] * k[j];
+      if (kv_int8) {
+        METAL_PRAGMA_UNROLL
+        for (uint jv = 0; jv < KV_LOAD_COUNT; jv++) {
+          const vec<char, LOAD_WIDTH> key_vec = reinterpret_cast<const device vec<char, LOAD_WIDTH>*>(keys_q8)[jv];
+          for (uint c = 0; c < LOAD_WIDTH; c++) {
+            score += q[jv * LOAD_WIDTH + c] * static_cast<U>(key_vec[c]);
+          }
+        }
+        score *= key_scales[i * num_kv_heads];
+      } else {
+        METAL_PRAGMA_UNROLL
+        for (uint jv = 0; jv < KV_LOAD_COUNT; jv++) {
+          const KVVec key_vec = reinterpret_cast<const device KVVec*>(keys)[jv];
+          for (uint c = 0; c < LOAD_WIDTH; c++) {
+            score += q[jv * LOAD_WIDTH + c] * static_cast<U>(key_vec[c]);
+          }
+        }
       }
       score = simd_sum(score);
 
@@ -131,15 +162,40 @@ PUBLIC KERNEL(AttentionSinglePass)(
       max_score = new_max;
       sum_exp_score = sum_exp_score * factor + exp_score;
 
-      // Update the output accumulator
-      for (uint j = 0; j < value_elements_per_thread; j++) {
-        o[j] = o[j] * factor + exp_score * values[j];
+      // Accumulate straight off the loaded vector
+      if (kv_int8) {
+        const U weighted = exp_score * static_cast<U>(value_scales[i * num_kv_heads]);
+        METAL_PRAGMA_UNROLL
+        for (uint jv = 0; jv < KV_LOAD_COUNT; jv++) {
+          const vec<char, LOAD_WIDTH> value_vec =
+              reinterpret_cast<const device vec<char, LOAD_WIDTH>*>(values_q8)[jv];
+          METAL_PRAGMA_UNROLL
+          for (uint c = 0; c < LOAD_WIDTH; c++) {
+            const uint j = jv * LOAD_WIDTH + c;
+            o[j] = o[j] * factor + weighted * static_cast<U>(value_vec[c]);
+          }
+        }
+      } else {
+        METAL_PRAGMA_UNROLL
+        for (uint jv = 0; jv < KV_LOAD_COUNT; jv++) {
+          const KVVec value_vec = reinterpret_cast<const device KVVec*>(values)[jv];
+          METAL_PRAGMA_UNROLL
+          for (uint c = 0; c < LOAD_WIDTH; c++) {
+            const uint j = jv * LOAD_WIDTH + c;
+            o[j] = o[j] * factor + exp_score * static_cast<U>(value_vec[c]);
+          }
+        }
       }
     }
 
     // Move the pointers to the next kv
-    keys += inner_k_stride;
-    values += inner_v_stride;
+    if (kv_int8) {
+      keys_q8 += inner_k_stride;
+      values_q8 += inner_v_stride;
+    } else {
+      keys += inner_k_stride;
+      values += inner_v_stride;
+    }
   }
 
   // Each thread has a partial part of the output so we need to combine them.

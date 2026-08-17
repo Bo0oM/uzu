@@ -101,10 +101,16 @@ struct SimdgroupMmaCore {
       if constexpr (gemm_alignment.contains(GemmAlignment::M)) {
         loader_a.load_unsafe();
       } else {
-        loader_a.load_safe(tile_dimensions_a);
+        // Aligned iterations are full-depth; only rows are partial, so the
+        // clamped vector load replaces the per-element masked one.
+        loader_a.load_rows_clamped(tile_dimensions_a.y);
       }
       if constexpr (gemm_alignment.contains(GemmAlignment::N)) {
         loader_b.load_unsafe();
+      } else if constexpr (TRANSPOSE_B && !Right::QUANTIZED) {
+        // Transposed fp B tiles are partial in rows only; the quantized
+        // loader keeps its own masked path.
+        loader_b.load_rows_clamped(tile_dimensions_b.y);
       } else {
         loader_b.load_safe(tile_dimensions_b);
       }

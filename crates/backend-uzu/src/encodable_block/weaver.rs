@@ -360,6 +360,7 @@ impl<B: Backend> Weaver<B> {
                         trie: None,
                         sinks: None,
                         state_type: &state_type,
+                        kv_quant: None,
                     },
                     encoder,
                 )

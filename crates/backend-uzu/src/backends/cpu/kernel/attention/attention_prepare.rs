@@ -37,8 +37,12 @@ fn apply_rope<ElementT: ArrayElement + Float, RopeT: ArrayElement + Float>(
 pub fn attention_prepare<ElementT: ArrayElement + Float, RopeT: ArrayElement + Float>(
     qkv: *const ElementT,
     queries: *mut ElementT,
-    #[optional(has_kv)] keys: Option<*mut ElementT>,
-    #[optional(has_kv)] values: Option<*mut ElementT>,
+    #[optional(has_kv && !kv_int8)] keys: Option<*mut ElementT>,
+    #[optional(has_kv && !kv_int8)] values: Option<*mut ElementT>,
+    #[optional(has_kv && kv_int8)] keys_q8: Option<*mut i8>,
+    #[optional(has_kv && kv_int8)] values_q8: Option<*mut i8>,
+    #[optional(has_kv && kv_int8)] key_scales: Option<*mut f32>,
+    #[optional(has_kv && kv_int8)] value_scales: Option<*mut f32>,
     #[optional(has_rope)] cosines: Option<*const RopeT>,
     #[optional(has_rope)] sines: Option<*const RopeT>,
     num_q_heads: u32,
@@ -49,26 +53,35 @@ pub fn attention_prepare<ElementT: ArrayElement + Float, RopeT: ArrayElement + F
     batch_dim: u32,
     #[specialize] has_kv: bool,
     #[specialize] has_rope: bool,
+    #[specialize] kv_int8: bool,
 ) {
     assert!(num_q_heads > 0 || has_kv, "attention prepare without KV requires at least one query head");
     assert!(head_dim > 0, "attention prepare requires nonzero head_dim");
-    assert_eq!(keys.is_some(), has_kv, "attention prepare keys presence mismatch");
-    assert_eq!(values.is_some(), has_kv, "attention prepare values presence mismatch");
+    assert_eq!(keys.is_some(), has_kv && !kv_int8, "attention prepare keys presence mismatch");
+    assert_eq!(values.is_some(), has_kv && !kv_int8, "attention prepare values presence mismatch");
+    assert_eq!(keys_q8.is_some(), has_kv && kv_int8, "attention prepare keys_q8 presence mismatch");
+    assert_eq!(values_q8.is_some(), has_kv && kv_int8, "attention prepare values_q8 presence mismatch");
+    assert_eq!(key_scales.is_some(), has_kv && kv_int8, "attention prepare key_scales presence mismatch");
+    assert_eq!(value_scales.is_some(), has_kv && kv_int8, "attention prepare value_scales presence mismatch");
     assert_eq!(num_kv_heads.is_some(), has_kv, "attention prepare num_kv_heads presence mismatch");
     assert_eq!(kv_token_offset.is_some(), has_kv, "attention prepare kv_token_offset presence mismatch");
     assert_eq!(cosines.is_some(), has_rope, "attention prepare cosines presence mismatch");
     assert_eq!(sines.is_some(), has_rope, "attention prepare sines presence mismatch");
     assert_eq!(rope_dim.is_some(), has_rope, "attention prepare rope_dim presence mismatch");
 
-    let (keys, values, num_kv_heads, kv_token_offset) =
-        if let (Some(keys), Some(values), Some(num_kv_heads), Some(kv_token_offset)) =
-            (keys, values, num_kv_heads, kv_token_offset)
-        {
+    let (num_kv_heads, kv_token_offset) =
+        if let (Some(num_kv_heads), Some(kv_token_offset)) = (num_kv_heads, kv_token_offset) {
             assert!(num_kv_heads > 0, "attention prepare has_kv requires nonzero num_kv_heads");
-            (keys, values, num_kv_heads as usize, kv_token_offset as usize)
+            (num_kv_heads as usize, kv_token_offset as usize)
         } else {
-            (std::ptr::null_mut(), std::ptr::null_mut(), 0, 0)
+            (0, 0)
         };
+    let keys = keys.unwrap_or(std::ptr::null_mut());
+    let values = values.unwrap_or(std::ptr::null_mut());
+    let keys_q8 = keys_q8.unwrap_or(std::ptr::null_mut());
+    let values_q8 = values_q8.unwrap_or(std::ptr::null_mut());
+    let key_scales = key_scales.unwrap_or(std::ptr::null_mut());
+    let value_scales = value_scales.unwrap_or(std::ptr::null_mut());
 
     let (cosines, sines, rope_dim) = if let (Some(cosines), Some(sines), Some(rope_dim)) = (cosines, sines, rope_dim) {
         assert!(rope_dim > 0, "attention prepare has_rope requires nonzero rope_dim");
@@ -88,37 +101,69 @@ pub fn attention_prepare<ElementT: ArrayElement + Float, RopeT: ArrayElement + F
         num_q_heads
     };
 
+    let mut row = vec![ElementT::zero(); head_dim];
     for batch_idx in 0..batch_dim {
         for head_idx in 0..total_heads {
             let qkv_head = unsafe { qkv.add(batch_idx * total_heads * head_dim + head_idx * head_dim) };
             let is_query = !has_kv || head_idx < num_q_heads;
             let is_key = has_kv && head_idx >= num_q_heads && head_idx < num_q_heads + num_kv_heads;
 
-            for head_dim_idx in 0..head_dim {
+            for (head_dim_idx, slot) in row.iter_mut().enumerate() {
                 let mut element = unsafe { *qkv_head.add(head_dim_idx) };
                 if has_rope && head_dim_idx < rope_dim && (is_query || is_key) {
                     element = apply_rope(qkv_head, cosines, sines, batch_idx, head_dim_idx, rope_dim);
                 }
+                *slot = element;
+            }
 
-                if is_query {
+            if is_query {
+                for (head_dim_idx, &element) in row.iter().enumerate() {
                     let query_offset = head_idx * batch_dim * head_dim + batch_idx * head_dim + head_dim_idx;
                     unsafe {
                         *queries.add(query_offset) = element;
                     }
-                } else if is_key {
-                    let key_offset = (kv_token_offset + batch_idx) * num_kv_heads * head_dim
-                        + (head_idx - num_q_heads) * head_dim
-                        + head_dim_idx;
-                    unsafe {
-                        *keys.add(key_offset) = element;
-                    }
+                }
+                continue;
+            }
+
+            let kv_head = if is_key {
+                head_idx - num_q_heads
+            } else {
+                head_idx - num_q_heads - num_kv_heads
+            };
+            let kv_row = (kv_token_offset + batch_idx) * num_kv_heads + kv_head;
+            let kv_offset = kv_row * head_dim;
+
+            if !kv_int8 {
+                let target = if is_key {
+                    keys
                 } else {
-                    let value_offset = (kv_token_offset + batch_idx) * num_kv_heads * head_dim
-                        + (head_idx - num_q_heads - num_kv_heads) * head_dim
-                        + head_dim_idx;
+                    values
+                };
+                for (head_dim_idx, &element) in row.iter().enumerate() {
                     unsafe {
-                        *values.add(value_offset) = element;
+                        *target.add(kv_offset + head_dim_idx) = element;
                     }
+                }
+                continue;
+            }
+
+            // Mirrors the Metal path: symmetric int8 with one absmax scale
+            // per (token, kv head).
+            let absmax = row.iter().fold(0.0f32, |acc, e| acc.max(e.to_f32().unwrap().abs()));
+            let scale = absmax.max(1e-8) / 127.0;
+            let (target, scales) = if is_key {
+                (keys_q8, key_scales)
+            } else {
+                (values_q8, value_scales)
+            };
+            unsafe {
+                *scales.add(kv_row) = scale;
+            }
+            for (head_dim_idx, &element) in row.iter().enumerate() {
+                let quantized = (element.to_f32().unwrap() / scale).round_ties_even().clamp(-127.0, 127.0) as i8;
+                unsafe {
+                    *target.add(kv_offset + head_dim_idx) = quantized;
                 }
             }
         }

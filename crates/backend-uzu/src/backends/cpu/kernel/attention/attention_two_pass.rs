@@ -4,7 +4,13 @@ use proc_macros::kernel;
 
 use crate::{
     array::ArrayElement,
-    backends::{common::gpu_types::trie::TrieNode, cpu::kernel::attention::mask::should_use_key},
+    backends::{
+        common::gpu_types::trie::TrieNode,
+        cpu::kernel::attention::{
+            kv_row::{KvRowSource, read_kv_row},
+            mask::should_use_key,
+        },
+    },
 };
 
 const TOTAL_BLOCKS_COUNT: u32 = 32;
@@ -14,8 +20,13 @@ const TOTAL_BLOCKS_COUNT: u32 = 32;
 #[variants(HEAD_DIM, 64, 128, 256, 512)]
 pub fn attention_two_pass1<T: ArrayElement + Float, const HEAD_DIM: u32>(
     queries: *const T,
-    keys: *const T,
-    values: *const T,
+    #[optional(!kv_int8)] keys: Option<*const T>,
+    #[optional(!kv_int8)] values: Option<*const T>,
+    #[optional(kv_int8)] keys_q8: Option<*const i8>,
+    #[optional(kv_int8)] values_q8: Option<*const i8>,
+    #[optional(kv_int8)] key_scales: Option<*const f32>,
+    #[optional(kv_int8)] value_scales: Option<*const f32>,
+    #[optional(kv_int8)] num_kv_heads: Option<u32>,
     out: *mut f32,
     sums: *mut f32,
     maxs: *mut f32,
@@ -33,6 +44,7 @@ pub fn attention_two_pass1<T: ArrayElement + Float, const HEAD_DIM: u32>(
     #[optional(is_sliding_window)] sliding_window_size: Option<u32>,
     #[optional(has_sinks)] sinks: Option<*const T>,
     #[specialize] has_sinks: bool,
+    #[specialize] kv_int8: bool,
     #[specialize] is_kv_cache_ring: bool,
     #[specialize] is_causal: bool,
     #[specialize] is_trie: bool,
@@ -44,6 +56,8 @@ pub fn attention_two_pass1<T: ArrayElement + Float, const HEAD_DIM: u32>(
     let value_dim = HEAD_DIM;
     let mut q = vec![0.0f32; HEAD_DIM as usize];
     let mut o = vec![0.0f32; HEAD_DIM as usize];
+    let mut key_row = vec![0.0f32; HEAD_DIM as usize];
+    let mut value_row = vec![0.0f32; HEAD_DIM as usize];
 
     let prefix_length = sequence_length - suffix_length;
     let suffix_position = if let Some(ring_params) = ring_params {
@@ -67,8 +81,26 @@ pub fn attention_two_pass1<T: ArrayElement + Float, const HEAD_DIM: u32>(
                 let kv_head_idx = head_idx / gqa_factor;
 
                 let queries_base: *const T = unsafe { queries.add((q_offset * HEAD_DIM) as usize) };
-                let keys_base: *const T = unsafe { keys.add((kv_head_idx * k_head_stride) as usize) };
-                let values_base: *const T = unsafe { values.add((kv_head_idx * v_head_stride) as usize) };
+                let key_source = KvRowSource {
+                    int8_base: keys_q8,
+                    float_base: keys,
+                    scales: key_scales,
+                    kv_int8,
+                    num_kv_heads,
+                    kv_head_idx,
+                    head_stride: k_head_stride,
+                    seq_stride: k_seq_stride,
+                };
+                let value_source = KvRowSource {
+                    int8_base: values_q8,
+                    float_base: values,
+                    scales: value_scales,
+                    kv_int8,
+                    num_kv_heads,
+                    kv_head_idx,
+                    head_stride: v_head_stride,
+                    seq_stride: v_seq_stride,
+                };
                 let out_base: *mut f32 =
                     unsafe { out.add((o_offset * TOTAL_BLOCKS_COUNT * value_dim + block_idx * value_dim) as usize) };
 
@@ -100,12 +132,12 @@ pub fn attention_two_pass1<T: ArrayElement + Float, const HEAD_DIM: u32>(
                         i,
                         is_causal,
                     ) {
-                        let keys_ptr = unsafe { keys_base.add((i * k_seq_stride) as usize) };
+                        read_kv_row(&key_source, i, &mut key_row);
 
                         // Compute the i-th score
                         let mut score = 0.0f32;
                         for j in 0..HEAD_DIM as usize {
-                            score += q[j] * unsafe { *keys_ptr.add(j) }.to_f32().unwrap();
+                            score += q[j] * key_row[j];
                         }
 
                         // Update the accumulators
@@ -117,9 +149,9 @@ pub fn attention_two_pass1<T: ArrayElement + Float, const HEAD_DIM: u32>(
                         sum_exp_score = sum_exp_score * factor + exp_score;
 
                         // Update the output accumulator
-                        let values_ptr = unsafe { values_base.add((i * v_seq_stride) as usize) };
+                        read_kv_row(&value_source, i, &mut value_row);
                         for j in 0..HEAD_DIM as usize {
-                            o[j] = o[j] * factor + exp_score * unsafe { *values_ptr.add(j) }.to_f32().unwrap();
+                            o[j] = o[j] * factor + exp_score * value_row[j];
                         }
                     }
                     i += TOTAL_BLOCKS_COUNT;

@@ -5,6 +5,9 @@
 #define METAL_PRAGMA_NO_UNROLL _Pragma("clang loop unroll(disable)")
 #define METAL_SIMD_SIZE 32
 
+// Symmetric int8 quantization bound shared by activation and KV-cache quant.
+UZU_CONST float INT8_QMAX = 127.0f;
+
 template <typename T, typename U>
 METAL_FUNC T div_ceil(T dividend, U divisor) {
   return (dividend + T(divisor) - T(1)) / T(divisor);

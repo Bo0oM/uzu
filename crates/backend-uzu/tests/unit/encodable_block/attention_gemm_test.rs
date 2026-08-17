@@ -93,6 +93,7 @@ fn get_output<T: ArrayElement + Float, B: Backend>(input: &Input<T>) -> Vec<T> {
         sliding_window_size: None,
         scale: Some(input.scale),
         data_type: T::data_type(),
+        kv_int8: false,
     };
 
     let queries_allocation = alloc_allocation_with_data::<B, T>(context.as_ref(), &input.queries);
@@ -112,6 +113,7 @@ fn get_output<T: ArrayElement + Float, B: Backend>(input: &Input<T>) -> Vec<T> {
         trie: None,
         sinks: None,
         state_type: &state_type,
+        kv_quant: None,
     };
 
     let mut encoder = Encoder::new(context.as_ref()).expect("Failed to create encoder");

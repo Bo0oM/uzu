@@ -21,6 +21,9 @@ use crate::backends::{
 
 static DEBUG_ENCODER_LABELS: LazyLock<bool> = LazyLock::new(|| std::env::var("UZU_METAL_DEBUG_ENCODER_LABELS").is_ok());
 
+static DEBUG_GROUPS: LazyLock<bool> =
+    LazyLock::new(|| *DEBUG_ENCODER_LABELS || std::env::var("METAL_CAPTURE_ENABLED").is_ok());
+
 pub struct MetalCommandBuffer;
 
 impl CommandBuffer for MetalCommandBuffer {
@@ -203,6 +206,10 @@ impl CommandBufferEncoding for MetalCommandBufferEncoding {
         &mut self,
         name: &str,
     ) {
+        if !*DEBUG_GROUPS {
+            return;
+        }
+
         if *DEBUG_ENCODER_LABELS {
             self.ensure_none();
         }
@@ -220,6 +227,10 @@ impl CommandBufferEncoding for MetalCommandBufferEncoding {
     }
 
     fn pop_debug_group(&mut self) {
+        if !*DEBUG_GROUPS {
+            return;
+        }
+
         if *DEBUG_ENCODER_LABELS {
             self.ensure_none();
         }
@@ -258,21 +269,21 @@ impl CommandBufferExecutable for MetalCommandBufferExecutable {
         let cmd_queue = self.command_buffer.command_queue();
         let wait_value = self.context.timeline_get_and_increment();
 
-        {
+        // Same-queue command buffers already execute in commit order with
+        // automatic hazard tracking, so the cross-queue wait is only needed
+        // when the sparse mapping queue touched the timeline since the last
+        // submit. The signal rides on the work buffer itself; the old
+        // three-buffer sandwich cost two extra commits per submit, which
+        // dominates short decode tokens on iOS (ADR-10).
+        if self.context.timeline_take_cross_queue_dirty() {
             let cmd_buffer = cmd_queue.command_buffer().expect("Failed to create command buffer");
             cmd_buffer.set_label(Some("sync (wait)"));
             cmd_buffer.encode_wait_for_event_value(self.context.timeline_event(), wait_value);
             cmd_buffer.commit();
         }
 
+        self.command_buffer.encode_signal_event_value(self.context.timeline_event(), wait_value + 1);
         self.command_buffer.commit();
-
-        {
-            let cmd_buffer = cmd_queue.command_buffer().expect("Failed to create command buffer");
-            cmd_buffer.set_label(Some("sync (signal)"));
-            cmd_buffer.encode_signal_event_value(self.context.timeline_event(), wait_value + 1);
-            cmd_buffer.commit();
-        }
 
         MetalCommandBufferPending {
             command_buffer: self.command_buffer,

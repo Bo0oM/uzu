@@ -2,17 +2,16 @@
 #include "../activation/activations.h"
 #include "../common/defines.h"
 #include "../common/dsl.h"
-#include "../common/thread_context.h"
-#include "../common/threadgroup_reduce.h"
 
 using namespace metal;
 
 #define UPDATE_THREADS 512
-// Bounds shared_o, which holds one o_i per dv for the cross-dv RMSNorm.
-#define UPDATE_MAX_HEAD_V_DIM 128
 
 // One simd group per output dim dv; 32 lanes cover Dk (coalesced state IO,
 // reduction via simd_sum). Activations are model dtype T; state stays float.
+// The grid splits each head's dv range over dv_blocks threadgroups so decode
+// fills the GPU (num_v_heads alone leaves most cores idle); RMSNorm + gate
+// run in the separate DeltaNetNormGate pass, which is latency-hidden.
 template <typename T, uint HEAD_K_DIM>
 VARIANTS(T, float, bfloat)
 VARIANTS(HEAD_K_DIM, 128)
@@ -20,7 +19,6 @@ PUBLIC KERNEL(DeltaNetUpdate)(
     device const T* in_proj,
     device const float* a_log,
     device const float* dt_bias,
-    device const float* norm_weight,
     device float* state,
     device T* out,
     constant const uint& num_v_heads,
@@ -28,10 +26,8 @@ PUBLIC KERNEL(DeltaNetUpdate)(
     constant const uint& head_v_dim,
     constant const uint& key_dim,
     constant const uint& value_dim,
-    constant const float& norm_epsilon,
-    threadgroup float shared_o[UPDATE_MAX_HEAD_V_DIM],
-    threadgroup float shared_scratch[METAL_SIMD_SIZE],
-    const ThreadContext thread_context,
+    constant const uint& dv_blocks,
+    const uint dv_block_idx GROUPS(dv_blocks),
     const uint hv_idx GROUPS(num_v_heads),
     const uint tid THREADS(UPDATE_THREADS)
 ) {
@@ -77,7 +73,9 @@ PUBLIC KERNEL(DeltaNetUpdate)(
   const float decay = fast::exp(-fast::exp(float(a_log[hv_idx])) * sp);
 
   // Delta rule over the dv owned by this simd group. State is [Hv, Dv, Dk].
-  for (uint dv = sg; dv < head_v_dim; dv += NUM_SG) {
+  const uint dv_span = head_v_dim / dv_blocks;
+  const uint dv_base = dv_block_idx * dv_span;
+  for (uint dv = dv_base + sg; dv < dv_base + dv_span; dv += NUM_SG) {
     const uint state_row = (hv_idx * head_v_dim + dv) * HEAD_K_DIM;
     const float v_i = float(in_proj[2 * key_dim + hv_idx * head_v_dim + dv]);
 
@@ -103,27 +101,7 @@ PUBLIC KERNEL(DeltaNetUpdate)(
     }
 
     if (lane == 0) {
-      shared_o[dv] = o_i;
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  // RMSNorm over all dv, then SiLU gate + write out.
-  float o_sq = 0.0f;
-  for (uint dv = tid; dv < head_v_dim; dv += UPDATE_THREADS) {
-    const float o = shared_o[dv];
-    o_sq += o * o;
-  }
-  const float o_sumsq =
-      threadgroup_cooperative_reduce<SimdReduceSum<float>, UPDATE_THREADS>(o_sq, shared_scratch, thread_context);
-  const float inv_rms = rsqrt(o_sumsq / float(head_v_dim) + norm_epsilon);
-
-  for (uint dv = sg; dv < head_v_dim; dv += NUM_SG) {
-    if (lane == 0) {
-      const float nw = float(norm_weight[dv]);
-      const float z_i = float(in_proj[conv_dim + hv_idx * head_v_dim + dv]);
-      const float z_silu = activate_silu(z_i);
-      out[hv_idx * head_v_dim + dv] = static_cast<T>(shared_o[dv] * inv_rms * nw * z_silu);
+      out[hv_idx * head_v_dim + dv] = static_cast<T>(o_i);
     }
   }
 }

@@ -3,16 +3,14 @@ use std::{
     path::Path,
     sync::{
         Arc, Weak,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
-#[cfg(test)]
-use metal::MTLSharedEvent;
 use metal::{
     MTL4CommandQueue, MTL4CommandQueueExt, MTLBuffer, MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager,
     MTLCommandBufferExt, MTLCommandQueue, MTLCommandQueueExt, MTLComputePipelineState, MTLDevice, MTLDeviceExt,
-    MTLEvent, MTLFunctionConstantValues, MTLLibrary, MTLResourceOptions, MTLSparsePageSize,
+    MTLEvent, MTLFunctionConstantValues, MTLLibrary, MTLResourceOptions, MTLSharedEvent, MTLSparsePageSize,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use parking_lot::{Mutex, MutexGuard};
@@ -43,18 +41,34 @@ pub struct MetalContext {
     pipeline_cache: Mutex<HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>>,
     sparse_heap_pool: Mutex<MetalSparseHeapPool>,
     device_tier: DeviceTier,
+    supports_mxu: bool,
     weak_self: Weak<MetalContext>,
-    #[cfg(test)]
-    timeline_shared_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    // Separate from `timeline_event` on purpose: making the hot-path timeline shared costs ~6%
+    // on decode. Signalled only when the sparse path is about to wait on it.
+    sparse_mapping_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    sparse_mapping_lock: Mutex<()>,
+    // True when the last timeline participant was the sparse mapping queue, so
+    // the next work submit must encode a cross-queue wait. Same-queue work
+    // submits order themselves by commit order + hazard tracking and skip it.
+    timeline_cross_queue_dirty: AtomicBool,
 }
+
+/// Budget must cover a full drain of the queue, prefill included.
+const SPARSE_MAPPING_WAIT_MS: u64 = 5_000;
+const SPARSE_MAPPING_WAIT_ATTEMPTS: u32 = 6;
 
 impl MetalContext {
     pub fn supports_mxu(&self) -> bool {
-        self.device.supports_mxu()
+        self.supports_mxu
     }
 
     pub(crate) fn device_tier(&self) -> DeviceTier {
         self.device_tier
+    }
+
+    /// Stable device identity for on-disk calibration caches.
+    pub(crate) fn device_label(&self) -> String {
+        format!("{} ({} cores)", self.device.name(), self.device.gpu_core_count())
     }
 
     pub(super) fn update_peak_memory_usage(&self) {
@@ -113,28 +127,80 @@ impl MetalContext {
         self.sparse_heap_pool.lock()
     }
 
+    /// Queues mapping updates and waits: releasing their buffers or heaps any earlier wedges the GPU.
+    pub(super) fn sparse_update_mappings_blocking(
+        &self,
+        mappings: &[MetalSparseMappingOpsBatch],
+    ) {
+        let Some(completion_value) = self.enqueue_sparse_mappings(mappings, true) else {
+            return;
+        };
+
+        for _ in 0..SPARSE_MAPPING_WAIT_ATTEMPTS {
+            if self.sparse_mapping_event.wait_until_signaled_value_timeout_ms(completion_value, SPARSE_MAPPING_WAIT_MS)
+            {
+                return;
+            }
+            eprintln!("Still waiting for sparse mapping update {completion_value} to complete on the GPU");
+        }
+
+        // The wait exists to keep these resources alive; returning without it would free them under a
+        // live command — the very fault this path guards. Leak them instead: bounded memory beats a
+        // wedged GPU, and only a queue that already stopped making progress can get here.
+        for op in mappings {
+            std::mem::forget(op.buffer.clone());
+            std::mem::forget(op.heap.clone());
+        }
+        eprintln!(
+            "Sparse mapping update {completion_value} never completed; leaking its buffers and heaps, the GPU is stuck"
+        );
+    }
+
+    /// Queues mapping updates without waiting; safe only while their buffers and heaps stay alive.
     pub(super) fn sparse_update_mappings(
         &self,
         mappings: &[MetalSparseMappingOpsBatch],
     ) {
+        self.enqueue_sparse_mappings(mappings, false);
+    }
+
+    /// Returns the timeline value the batch signals on completion, or `None` if there was nothing to do.
+    fn enqueue_sparse_mappings(
+        &self,
+        mappings: &[MetalSparseMappingOpsBatch],
+        signal_cpu_visible: bool,
+    ) -> Option<u64> {
         if mappings.is_empty() {
-            return;
+            return None;
         }
+
+        // Ticket and encoding must stay atomic — the queue runs commands in submission order.
+        let _guard = self.sparse_mapping_lock.lock();
 
         let wait_value = self.timeline_get_and_increment();
         self.command_queue4.wait_for_event_value(&self.timeline_event, wait_value);
         for op in mappings {
             self.command_queue4.update_buffer_mappings(&op.buffer, Some(op.heap.lock().heap()), &op.mtl_operations);
         }
-        self.command_queue4.signal_event_value(&self.timeline_event, wait_value + 1);
+        let completion_value = wait_value + 1;
+        self.command_queue4.signal_event_value(&self.timeline_event, completion_value);
+        self.timeline_cross_queue_dirty.store(true, Ordering::Release);
+        if signal_cpu_visible {
+            self.command_queue4
+                .signal_event_value(ProtocolObject::from_ref(&*self.sparse_mapping_event), completion_value);
+        }
 
-        // This line prevent tests from freezing, showing pink screen and shutting down computer
-        #[cfg(test)]
-        self.timeline_shared_event.wait_until_signaled_value_timeout_ms(wait_value, 10);
+        Some(completion_value)
     }
 
     pub(super) fn timeline_get_and_increment(&self) -> u64 {
         self.timeline_value.fetch_add(1, Ordering::Release)
+    }
+
+    /// Clears and returns whether the sparse queue touched the timeline since
+    /// the last work submit.
+    pub(super) fn timeline_take_cross_queue_dirty(&self) -> bool {
+        self.timeline_cross_queue_dirty.swap(false, Ordering::AcqRel)
     }
 
     pub(super) fn timeline_event(&self) -> &ProtocolObject<dyn MTLEvent> {
@@ -156,12 +222,12 @@ impl Context for MetalContext {
 
         let gpu_core_count = device.gpu_core_count();
         let device_tier = device_tier_for_device(gpu_core_count, device.as_ref());
+        let supports_mxu = device.supports_mxu();
         let page_size = MTLSparsePageSize::KB256;
         let heap_capacity = Metal::ALLOCATION_GRANULARITY;
         let sparse_pool = MetalSparseHeapPool::new(page_size, heap_capacity);
         let timeline_event = device.new_event().ok_or(MetalError::CannotCreateEvent)?;
-        #[cfg(test)]
-        let timeline_shared_event = device.new_shared_event().ok_or(MetalError::CannotCreateEvent)?;
+        let sparse_mapping_event = device.new_shared_event().ok_or(MetalError::CannotCreateEvent)?;
 
         Ok(Arc::new_cyclic(|weak_self| Self {
             device,
@@ -175,9 +241,11 @@ impl Context for MetalContext {
             pipeline_cache: Mutex::new(HashMap::new()),
             sparse_heap_pool: Mutex::new(sparse_pool),
             device_tier,
+            supports_mxu,
             weak_self: weak_self.clone(),
-            #[cfg(test)]
-            timeline_shared_event,
+            sparse_mapping_event,
+            sparse_mapping_lock: Mutex::new(()),
+            timeline_cross_queue_dirty: AtomicBool::new(true),
         }))
     }
 
@@ -266,10 +334,13 @@ impl Context for MetalContext {
 
     fn device_capabilities(&self) -> DeviceCapabilities {
         let mut capabilities = DeviceCapabilities::empty();
-        if self.device.supports_placement_sparse_resources() {
+        // A/B knob for the sparse KV path (ADR-10.V): the second MTL4 queue
+        // and its cross-queue syncs are a suspected per-token cost on iOS.
+        let sparse_disabled = std::env::var_os("UZU_DISABLE_SPARSE").is_some();
+        if !sparse_disabled && self.device.supports_placement_sparse_resources() {
             capabilities |= DeviceCapabilities::SPARSE_BUFFERS;
         }
-        if self.device.supports_mxu() {
+        if self.supports_mxu {
             capabilities |= DeviceCapabilities::NATIVE_INT8_MATMUL;
         }
         capabilities

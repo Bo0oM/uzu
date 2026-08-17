@@ -14,25 +14,30 @@ namespace gemm {
 // 2^-(BITS*k). qdot then reads the matching nibble/byte in place (value =
 // q * 2^(BITS*k)); the factors cancel, so the dot product is unchanged. All
 // factors are powers of two, so this is bit-exact.
-template <typename T, typename U, int VALUES_PER_THREAD, int BITS>
-METAL_FUNC U load_vector(const device T* x, thread U* x_thread, const bool signed_codes) {
+// MT is the storage/multiply type of the staged activations (half on tiers
+// with double-rate FP16 ALUs, otherwise U); sums and dequant math stay in U.
+// The float->MT convert happens once per K block and is amortized over the
+// RESULTS_PER_SIMDGROUP qdot calls that reuse x_thread.
+template <typename T, typename U, typename MT, int VALUES_PER_THREAD, int BITS>
+METAL_FUNC U load_vector(const device T* x, thread MT* x_thread, const bool signed_codes) {
   using U4 = vec<U, 4>;
+  using MT4 = vec<MT, 4>;
   const U4 inv = (BITS == 8 && signed_codes)
                      ? U4(U(1))
                      : U4(U(1), U(1) / U(1u << BITS), U(1) / U(1u << (2u * BITS)), U(1) / U(1u << (3u * BITS)));
   U sum = 0;
-  thread U4* x_vec4 = reinterpret_cast<thread U4*>(x_thread);
+  thread MT4* x_vec4 = reinterpret_cast<thread MT4*>(x_thread);
   METAL_PRAGMA_UNROLL
   for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
     U4 v = U4(x[4 * i], x[4 * i + 1], x[4 * i + 2], x[4 * i + 3]);
     sum += v[0] + v[1] + v[2] + v[3];
-    x_vec4[i] = v * inv;
+    x_vec4[i] = MT4(v * inv);
   }
   return sum;
 }
 
-template <typename T, typename U, int VALUES_PER_THREAD>
-METAL_FUNC U load_vector_safe(const device T* x, thread U* x_thread, int N) {
+template <typename T, typename U, typename MT, int VALUES_PER_THREAD>
+METAL_FUNC U load_vector_safe(const device T* x, thread MT* x_thread, int N) {
   U sum = 0;
   METAL_PRAGMA_UNROLL
   for (int i = 0; i < VALUES_PER_THREAD; ++i) {
@@ -41,29 +46,51 @@ METAL_FUNC U load_vector_safe(const device T* x, thread U* x_thread, int N) {
   for (int i = 0; i < N; ++i) {
     U v = x[i];
     sum += v;
-    x_thread[i] = v;
+    x_thread[i] = MT(v);
   }
   return sum;
 }
 
-template <typename U, int VALUES_PER_THREAD, int BITS>
-METAL_FUNC U qdot(const device uint8_t* w, const thread U* x_thread, U scale, U bias, U sum, const bool signed_codes) {
+template <typename U, typename MT, int VALUES_PER_THREAD, int BITS>
+METAL_FUNC U
+qdot(const device uint8_t* w, const thread MT* x_thread, U scale, U bias, U sum, const bool signed_codes) {
   static_assert(BITS == 4 || BITS == 8, "Only int4 and int8 supported");
+  static_assert(is_same_v<MT, U> || BITS == 4, "Half staging is wired for the 4-bit path only");
 
   U accumulator = 0;
   if constexpr (BITS == 4) {
-    using U4 = vec<U, 4>;
     const device ushort* weight_words = reinterpret_cast<const device ushort*>(w);
-    const thread U4* x_vec4 = reinterpret_cast<const thread U4*>(x_thread);
     const ushort packed_mask = signed_codes ? 0x8888u : 0u;
+    MT mt_accumulator = 0;
     METAL_PRAGMA_UNROLL
     for (int i = 0; i < (VALUES_PER_THREAD / 4); i++) {
-      // Mask each nibble in place (no shifts); value of lane k is n_k << (4*k),
-      // i.e. n_k * 16^k, which is < 2^23 so the magic-number convert is valid.
-      // The matching x lane was pre-divided by 16^k in load_vector.
-      const uint4 lanes = uint4(ushort(weight_words[i] ^ packed_mask)) & uint4(0x000fu, 0x00f0u, 0x0f00u, 0xf000u);
-      const U4 weight_vec4 = U4(as_type<float4>(lanes | uint4(0x4b000000u)) - float4(8388608.0f));
-      accumulator += dot(x_vec4[i], weight_vec4);
+      // Mask each nibble in place (no shifts); the value of lane k is
+      // n_k * 16^k and the matching x lane was pre-divided by 16^k in
+      // load_vector. The masked words feed the multiplies directly: the
+      // int-to-float converts are full-rate and the four lanes stay
+      // independent scalar chains, which beats both the vec4 magic-number
+      // conversion and a single wide uint2 load on Apple GPUs (measured).
+      const ushort word = weight_words[i] ^ packed_mask;
+      if constexpr (is_same_v<MT, U>) {
+        accumulator += x_thread[4 * i] * static_cast<U>(word & 0x000fu) +
+                       x_thread[4 * i + 1] * static_cast<U>(word & 0x00f0u) +
+                       x_thread[4 * i + 2] * static_cast<U>(word & 0x0f00u) +
+                       x_thread[4 * i + 3] * static_cast<U>(word & 0xf000u);
+      } else {
+        // The whole per-call reduction runs in MT so every multiply-add hits
+        // the double-rate FP16 pipes; one convert per call feeds the U
+        // accumulator, which carries the cross-block sum in full precision.
+        // The masked nibbles (<= 15 * 2^12) and the 1/16^k-scaled x lanes are
+        // exact in half; the products and the VALUES_PER_THREAD-deep partial
+        // sum round at MT precision, still under the 4-bit quantization noise.
+        mt_accumulator += x_thread[4 * i] * static_cast<MT>(word & 0x000fu) +
+                          x_thread[4 * i + 1] * static_cast<MT>(word & 0x00f0u) +
+                          x_thread[4 * i + 2] * static_cast<MT>(word & 0x0f00u) +
+                          x_thread[4 * i + 3] * static_cast<MT>(word & 0xf000u);
+      }
+    }
+    if constexpr (!is_same_v<MT, U>) {
+      accumulator = static_cast<U>(mt_accumulator);
     }
   } else if constexpr (BITS == 8) {
     using U4 = vec<U, 4>;
@@ -89,23 +116,67 @@ METAL_FUNC U qdot(const device uint8_t* w, const thread U* x_thread, U scale, U 
   return scale * accumulator + sum * adjusted_bias;
 }
 
-template <typename U, int VALUES_PER_THREAD, int BITS>
+// Batched qdot: one weight word is unpacked once and multiplied into M_TILE
+// activation vectors, so the weight load and the int-to-float converts are
+// amortized across the batch — the reason a batched pass can approach the
+// cost of a single-row pass on dequant-ALU-bound forms. x_thread holds
+// M_TILE stacked lanes ([b * VALUES_PER_THREAD + i]); results has stride
+// RESULT_STRIDE between batch elements of the same row.
+template <typename U, typename MT, int M_TILE, int RESULT_STRIDE, int VALUES_PER_THREAD, int BITS>
+METAL_FUNC void qdot_batched(
+    const device uint8_t* w,
+    const thread MT* x_thread,
+    const thread U* input_sums,
+    U scale,
+    U bias,
+    thread U* results,
+    const bool signed_codes
+) {
+  static_assert(BITS == 4, "Batched qdot is wired for the 4-bit path only");
+
+  U acc[M_TILE] = {};
+  const device ushort* weight_words = reinterpret_cast<const device ushort*>(w);
+  const ushort packed_mask = signed_codes ? 0x8888u : 0u;
+  METAL_PRAGMA_UNROLL
+  for (int i = 0; i < (VALUES_PER_THREAD / 4); i++) {
+    const ushort word = weight_words[i] ^ packed_mask;
+    const MT w0 = static_cast<MT>(word & 0x000fu);
+    const MT w1 = static_cast<MT>(word & 0x00f0u);
+    const MT w2 = static_cast<MT>(word & 0x0f00u);
+    const MT w3 = static_cast<MT>(word & 0xf000u);
+    METAL_PRAGMA_UNROLL
+    for (int b = 0; b < M_TILE; b++) {
+      const thread MT* x = x_thread + b * VALUES_PER_THREAD;
+      acc[b] += static_cast<U>(x[4 * i] * w0) + static_cast<U>(x[4 * i + 1] * w1) +
+                static_cast<U>(x[4 * i + 2] * w2) + static_cast<U>(x[4 * i + 3] * w3);
+    }
+  }
+  METAL_PRAGMA_UNROLL
+  for (int b = 0; b < M_TILE; b++) {
+    results[b * RESULT_STRIDE] += scale * acc[b] + input_sums[b] * bias;
+  }
+}
+
+// The tail runs at most once per dispatch, so MT staging is converted back
+// to U here instead of duplicating the fast path.
+template <typename U, typename MT, int VALUES_PER_THREAD, int BITS>
 METAL_FUNC U
-qdot_safe(const device uint8_t* w, const thread U* x_thread, U scale, U bias, U sum, int N, const bool signed_codes) {
+qdot_safe(const device uint8_t* w, const thread MT* x_thread, U scale, U bias, U sum, int N, const bool signed_codes) {
   static_assert(BITS == 4 || BITS == 8, "Only int4 and int8 supported");
 
   U accumulator = 0;
   if constexpr (BITS == 4) {
     using U4 = vec<U, 4>;
+    using MT4 = vec<MT, 4>;
     const device uint16_t* weight_words = reinterpret_cast<const device uint16_t*>(w);
-    const thread U4* x_vec4 = reinterpret_cast<const thread U4*>(x_thread);
+    const thread MT4* x_vec4 = reinterpret_cast<const thread MT4*>(x_thread);
     const uint16_t packed_mask = signed_codes ? 0x8888u : 0u;
 
     int full_chunks = N / 4;
     for (int i = 0; i < full_chunks; i++) {
       uint16_t weight_word = weight_words[i] ^ packed_mask;
       U4 weight_vec4 = uint4_to_fp4<U, 4>(uint4(weight_word, weight_word >> 4, weight_word >> 8, weight_word >> 12));
-      accumulator += dot(x_vec4[i], weight_vec4);
+      accumulator += dot(U4(x_vec4[i]), weight_vec4);
     }
 
     int remainder = N & 3;

@@ -138,7 +138,8 @@ impl SparseBuffer for MetalSparseBuffer {
         }
 
         // execute operations
-        context.sparse_update_mappings(&all_batches);
+        // Blocking: `all_batches` holds the last reference to the buffer and to emptied heaps.
+        context.sparse_update_mappings_blocking(&all_batches);
         for mapped_range in mapped_ranges {
             self.mapped_pages.remove(mapped_range)
         }

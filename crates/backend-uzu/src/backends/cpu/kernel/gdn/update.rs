@@ -2,14 +2,14 @@ use half::bf16;
 use num_traits::Float;
 use proc_macros::kernel;
 
-use crate::{array::ArrayElement, backends::common::gpu_types::ActivationType};
+use crate::array::ArrayElement;
 
-// Single-token delta net update: decay state, apply delta rule, RMSNorm + SiLU gate.
+// Single-token delta net update: decay state, apply delta rule, write raw output.
 // Steps per v-head:
 //   1. L2-normalize and scale q, k
 //   2. Compute decay from a_log and softplus(a_raw + dt_bias)
 //   3. For each v-dim: read state, compute output, update state with delta rule
-//   4. RMSNorm output, gate with SiLU(z), write result
+// RMSNorm + SiLU gate run in the separate DeltaNetNormGate pass.
 #[kernel(DeltaNetUpdate)]
 #[variants(T, f32, bf16)]
 #[variants(HEAD_K_DIM, 128)]
@@ -17,7 +17,6 @@ pub fn delta_net_update<T: ArrayElement + Float, const HEAD_K_DIM: u32>(
     in_proj: *const T,
     a_log: *const T,
     dt_bias: *const T,
-    norm_weight: *const T,
     state: *mut T,
     out: *mut T,
     num_v_heads: u32,
@@ -25,8 +24,9 @@ pub fn delta_net_update<T: ArrayElement + Float, const HEAD_K_DIM: u32>(
     head_v_dim: u32,
     key_dim: u32,
     value_dim: u32,
-    norm_epsilon: f32,
+    dv_blocks: u32,
 ) {
+    debug_assert!(head_v_dim.is_multiple_of(dv_blocks), "head_v_dim must split evenly over dv_blocks");
     let state_ptr = state as *const T;
 
     let num_v_heads = num_v_heads as usize;
@@ -126,18 +126,9 @@ pub fn delta_net_update<T: ArrayElement + Float, const HEAD_K_DIM: u32>(
             }
         }
 
-        // RMSNorm over o
-        let sumsq: f32 = o.iter().map(|x| x * x).sum();
-        let inv_rms = 1.0 / (sumsq / head_v_dim as f32 + norm_epsilon).sqrt();
-
-        // Apply RMSNorm + SiLU gate and write output
         for i in 0..head_v_dim {
-            let norm_w = unsafe { (*norm_weight.add(i)).to_f32().unwrap() };
-            let z_i = unsafe { (*in_proj.add(conv_dim + hv * head_v_dim + i)).to_f32().unwrap() };
-            let z_silu = ActivationType::SILU.activate(z_i);
-            let final_val = o[i] * inv_rms * norm_w * z_silu;
             unsafe {
-                *out.add(hv * head_v_dim + i) = T::from(final_val).unwrap();
+                *out.add(hv * head_v_dim + i) = T::from(o[i]).unwrap();
             }
         }
     }

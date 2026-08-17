@@ -187,6 +187,9 @@ impl<'encoding, B: Backend> Encoder<'encoding, B> {
         &mut self,
         accesses: &[Access],
     ) {
+        if !B::NEEDS_BARRIERS {
+            return;
+        }
         if let Some((after, before)) = self.hazard_tracker.access(accesses) {
             self.command_buffer.encode_barrier(after, before);
         }
@@ -229,11 +232,36 @@ pub struct Pending<B: Backend> {
 
 impl<B: Backend> Pending<B> {
     pub fn wait_until_completed(self) -> Result<Completed<B>, B::Error> {
-        Ok(Completed {
+        let completed = Completed {
             command_buffer: self.command_buffer.wait_until_completed()?,
             _allocation_pool: self.allocation_pool,
-        })
+        };
+        if gpu_trace_enabled() {
+            GPU_TRACE_BUSY_NANOS
+                .fetch_add(completed.gpu_execution_time().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            GPU_TRACE_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(completed)
     }
+}
+
+// PROBE (UZU_GPU_TRACE=1): accumulates per-submit GPU-busy time so probes can
+// compare it with wall time — the decisive number for GPU-resident decode
+// (a wall >> busy gap means the host between submissions is visible).
+static GPU_TRACE_BUSY_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GPU_TRACE_SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn gpu_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("UZU_GPU_TRACE").is_ok_and(|v| v != "0"))
+}
+
+/// (accumulated GPU-busy nanoseconds, submit count) since process start.
+pub fn gpu_trace_snapshot() -> (u64, u64) {
+    (
+        GPU_TRACE_BUSY_NANOS.load(std::sync::atomic::Ordering::Relaxed),
+        GPU_TRACE_SUBMITS.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 pub struct Completed<B: Backend> {
