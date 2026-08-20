@@ -45,20 +45,27 @@ struct CacheEntry {
     packs: u32,
 }
 
+
 #[derive(Serialize, Deserialize, Default)]
 struct CacheFile {
     device: String,
     engine: String,
+    /// Hash of the compiled shaders the winners were measured against.
+    ///
+    /// The rest of the key — device and package version — does not move
+    /// between builds of a development branch, so without this the cache kept
+    /// serving tiles measured against kernels that had since been rewritten.
+    /// Silently: a stale tile is still a valid one, just no longer the
+    /// fastest. It cost 7.5% of gemma-3-1b-4bit decode before this field
+    /// existed, and the branch's own benchmark table was written from it.
+    #[serde(default)]
+    shaders: String,
     entries: Vec<CacheEntry>,
 }
 
 fn cache_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join("Library/Caches/uzu/tile_cache.json"))
-}
-
-fn engine_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
 }
 
 struct AutotuneState {
@@ -87,6 +94,8 @@ fn with_state<R>(
             policy::set_autotune_override(
                 entry.n,
                 entry.k,
+                entry.group_size,
+                entry.bits,
                 GemvTile {
                     num_simdgroups: entry.num_simdgroups,
                     k_split: entry.k_split,
@@ -108,7 +117,11 @@ fn load_cache(device: &str) -> CacheFile {
         return CacheFile::default();
     };
     match serde_json::from_str::<CacheFile>(&text) {
-        Ok(cache) if cache.device == device && cache.engine == engine_version() => cache,
+        Ok(cache)
+            if cache.device == device && cache.engine == crate::VERSION && cache.shaders == crate::backends::metal::kernel::METAL_SHADER_FINGERPRINT =>
+        {
+            cache
+        },
         _ => CacheFile::default(),
     }
 }
@@ -138,7 +151,7 @@ pub(crate) fn needs_calibration(
         return false;
     }
     let device = context.device_label();
-    with_state(&device, |state| !state.resolved.contains(&(n, k, group_size, bits)))
+    with_state(device, |state| !state.resolved.contains(&(n, k, group_size, bits)))
 }
 
 /// Candidate tiles for a quantized decode shape. The fitted default is
@@ -177,11 +190,12 @@ pub(crate) fn record_winner(
     winner: GemvTile,
 ) {
     let device = context.device_label();
-    with_state(&device, |state| {
-        policy::set_autotune_override(n, k, winner);
+    with_state(device, |state| {
+        policy::set_autotune_override(n, k, group_size, bits, winner);
         state.resolved.insert((n, k, group_size, bits));
-        state.cache.device = device.clone();
-        state.cache.engine = engine_version().to_string();
+        state.cache.device = device.to_string();
+        state.cache.engine = crate::VERSION.to_string();
+        state.cache.shaders = crate::backends::metal::kernel::METAL_SHADER_FINGERPRINT.to_string();
         state.cache.entries.retain(|e| !(e.n == n && e.k == k && e.group_size == group_size && e.bits == bits));
         state.cache.entries.push(CacheEntry {
             n,
@@ -207,7 +221,7 @@ pub(crate) fn mark_resolved(
     bits: u32,
 ) {
     let device = context.device_label();
-    with_state(&device, |state| {
+    with_state(device, |state| {
         state.resolved.insert((n, k, group_size, bits));
     });
 }

@@ -1,5 +1,12 @@
 [
     {
+        "name": "foundation-sec",
+        "parsing": "foundation-sec",
+        "rendering": "foundation-sec",
+        "tokens": "foundation-sec",
+        "ordering": "default-no-tools"
+    },
+    {
         "name": "functiongemma",
         "parsing": "functiongemma",
         "rendering": "functiongemma",
@@ -56,6 +63,13 @@
         "ordering": "default"
     },
     {
+        "name": "muse-glimmer",
+        "parsing": "muse-glimmer",
+        "rendering": "muse-glimmer",
+        "tokens": "muse-glimmer",
+        "ordering": "default"
+    },
+    {
         "name": "qwen3",
         "parsing": "qwen3",
         "rendering": "qwen3",
@@ -88,13 +102,6 @@
         "parsing": "qwen3.6",
         "rendering": "qwen3.6",
         "tokens": "qwen3.6",
-        "ordering": "default"
-    },
-    {
-        "name": "muse-glimmer",
-        "parsing": "muse-glimmer",
-        "rendering": "muse-glimmer",
-        "tokens": "muse-glimmer",
         "ordering": "default"
     }
 ]

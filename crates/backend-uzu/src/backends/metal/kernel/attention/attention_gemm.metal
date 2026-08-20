@@ -188,9 +188,47 @@ KERNEL(AttentionGemm)(
     kb_lim = min(int(params.nk), (q_max + int(BK) - 1) / int(BK));
   }
 
+  // A ring cache is addressed by its capacity, not by how much of it is live:
+  // `q_off` is the window size even when only `ring_length` slots hold real
+  // keys. The element mask below already drops the dead slots, but only after
+  // their block has been staged into threadgroup memory and pushed through the
+  // matrix units — on a first prefill chunk, where the ring is empty, that is
+  // every prefix block. A block that lies entirely outside the live run
+  // contributes nothing but -inf scores, so skipping it changes no result.
+  const int prefix_blocks = params.q_off / int(BK);
+  const bool skip_dead_ring_blocks = is_kv_cache_ring
+      && ring_params.ring_offset + ring_params.ring_length <= uint(params.q_off);
+  const int live_first_block = int(ring_params.ring_offset) / int(BK);
+  const int live_last_block =
+      int(ring_params.ring_offset + ring_params.ring_length + uint(BK) - 1) / int(BK);
+
   const int q_base = int(q_tile_idx) * BLOCK_QUERY_ROWS + int(simdgroup_row_base);
   const int prefix_length = params.q_off;
   const int suffix_position = is_kv_cache_ring ? int(ring_params.ring_length) : prefix_length;
+
+  // A sliding window also puts a floor under the keys a query tile can see.
+  // Inside the suffix those keys are physically contiguous, so everything below
+  // the floor is a run of blocks that the element mask would zero in full. This
+  // is what a prompt longer than the window pays for: with a 512 window and 850
+  // tokens in one chunk, the last query tile masks away more than half of the
+  // suffix blocks it loads.
+  //
+  // Not on the trie path. There a query's position is its node's height, which
+  // the element mask reads below and which can sit far under the row index, so
+  // a floor derived from the index would be too high and would skip blocks
+  // those rows still need -- silently, since a skipped block never reaches the
+  // element mask. Verification batches are a handful of tokens anyway, so the
+  // floor would save nothing there.
+  int suffix_first_live_block = prefix_blocks;
+  if (is_sliding_window && is_causal && !is_trie) {
+    const int tile_first_query = int(suffix_position) + int(q_tile_idx) * BLOCK_QUERY_ROWS;
+    const int oldest_key = max(0, tile_first_query - int(sliding_window_size) + 1);
+    const int oldest_suffix_index = oldest_key - int(suffix_position);
+    if (oldest_suffix_index > 0) {
+      suffix_first_live_block = prefix_blocks + oldest_suffix_index / int(BK);
+    }
+  }
+
   using KVBlockSource = BlockSource<
       T,
       BK,
@@ -201,6 +239,12 @@ KERNEL(AttentionGemm)(
   threadgroup T* kv_shared = kv_smem;
 
   for (int kb = 0; kb < kb_lim; kb++) {
+    if (skip_dead_ring_blocks && kb < prefix_blocks && (kb < live_first_block || kb >= live_last_block)) {
+      continue;
+    }
+    if (kb >= prefix_blocks && kb < suffix_first_live_block) {
+      continue;
+    }
     const bool tail_k = (!align_k && kb == int(params.nk_aligned));
     const short valid_k_rows = tail_k ? short(params.k_rem) : short(BK);
     const device T* k_block = k + int64_t(kb) * int(BK) * key_source_stride;

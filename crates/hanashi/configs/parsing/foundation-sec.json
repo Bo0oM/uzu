@@ -1,0 +1,103 @@
+{
+    "reduction": {
+        "groups": [
+            {
+                "type": "bounded",
+                "name": "system",
+                "open_token": "<|system|>",
+                "close_tokens": [
+                    "<|end_of_text|>"
+                ],
+                "closes_on_sibling": true
+            },
+            {
+                "type": "bounded",
+                "name": "user",
+                "open_token": "<|user|>",
+                "close_tokens": [
+                    "<|end_of_text|>"
+                ],
+                "closes_on_sibling": true
+            },
+            {
+                "type": "bounded",
+                "name": "assistant",
+                "open_token": "<|assistant|>",
+                "close_tokens": [
+                    "<|end_of_text|>"
+                ],
+                "closes_on_sibling": true,
+                "groups": [
+                    {
+                        "type": "bounded",
+                        "name": "reasoning",
+                        "closes_on_sibling": true,
+                        "open_token": "<think>",
+                        "close_tokens": [
+                            "</think>"
+                        ]
+                    }
+                ]
+            }
+        ]
+    },
+    "transformation": {
+        "system": [
+            {
+                "type": "object",
+                "fields": {
+                    "role": [
+                        {
+                            "type": "literal",
+                            "value": "system"
+                        }
+                    ],
+                    "content": [
+                        {
+                            "type": "get",
+                            "key": "$value"
+                        }
+                    ]
+                }
+            }
+        ],
+        "user": [
+            {
+                "type": "object",
+                "fields": {
+                    "role": [
+                        {
+                            "type": "literal",
+                            "value": "user"
+                        }
+                    ],
+                    "content": [
+                        {
+                            "type": "get",
+                            "key": "$value"
+                        }
+                    ]
+                }
+            }
+        ],
+        "assistant": [
+            {
+                "type": "object",
+                "fields": {
+                    "role": [
+                        {
+                            "type": "literal",
+                            "value": "assistant"
+                        }
+                    ],
+                    "content": [
+                        {
+                            "type": "get",
+                            "key": "$value"
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+}

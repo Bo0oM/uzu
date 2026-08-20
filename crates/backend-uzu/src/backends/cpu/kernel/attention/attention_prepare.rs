@@ -2,6 +2,7 @@ use half::bf16;
 use num_traits::Float;
 use proc_macros::kernel;
 
+use crate::backends::cpu::kernel::activation_transform::INT8_SYMMETRIC_QUANTIZATION_MAXIMUM;
 use crate::array::ArrayElement;
 
 fn apply_rope<ElementT: ArrayElement + Float, RopeT: ArrayElement + Float>(
@@ -151,7 +152,7 @@ pub fn attention_prepare<ElementT: ArrayElement + Float, RopeT: ArrayElement + F
             // Mirrors the Metal path: symmetric int8 with one absmax scale
             // per (token, kv head).
             let absmax = row.iter().fold(0.0f32, |acc, e| acc.max(e.to_f32().unwrap().abs()));
-            let scale = absmax.max(1e-8) / 127.0;
+            let scale = absmax.max(1e-8) / INT8_SYMMETRIC_QUANTIZATION_MAXIMUM;
             let (target, scales) = if is_key {
                 (keys_q8, key_scales)
             } else {
@@ -161,7 +162,7 @@ pub fn attention_prepare<ElementT: ArrayElement + Float, RopeT: ArrayElement + F
                 *scales.add(kv_row) = scale;
             }
             for (head_dim_idx, &element) in row.iter().enumerate() {
-                let quantized = (element.to_f32().unwrap() / scale).round_ties_even().clamp(-127.0, 127.0) as i8;
+                let quantized = (element.to_f32().unwrap() / scale).round_ties_even().clamp(-INT8_SYMMETRIC_QUANTIZATION_MAXIMUM, INT8_SYMMETRIC_QUANTIZATION_MAXIMUM) as i8;
                 unsafe {
                     *target.add(kv_offset + head_dim_idx) = quantized;
                 }

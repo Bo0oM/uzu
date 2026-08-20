@@ -15,6 +15,11 @@ fn infer_template(name: &str) -> Option<&'static str> {
     if has("functiongemma") {
         return Some("functiongemma");
     }
+    // Cisco's security models are Llama-3.1 derivatives but carry their own
+    // role tags, so they must not fall through to the llama template.
+    if has("foundation-sec") || has("foundationai-security") {
+        return Some("foundation-sec");
+    }
     if has("gemma-4") || has("gemma4") {
         return Some("gemma-4");
     }
@@ -58,6 +63,31 @@ fn infer_template(name: &str) -> Option<&'static str> {
     None
 }
 
+/// Whether the name names more than one unrelated family.
+///
+/// The nesting `infer_template` relies on is deliberate — a Foundation-Sec
+/// checkpoint really is called `Llama-3.1-FoundationAI-...`, and `qwen3.5`
+/// really does contain `qwen3` — so those do not count. A merge or a
+/// fine-tune whose directory carries two families that are *not* nested does,
+/// and for it the first match in a fixed order is a guess, not an answer.
+fn names_more_than_one_family(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let has = |needle: &str| name.contains(needle);
+    // Its own family, and the one it is built on, is not two families.
+    if has("foundation-sec") || has("foundationai-security") {
+        return false;
+    }
+    let families = [
+        has("gemma"),
+        has("gpt-oss"),
+        has("lfm2"),
+        has("llama"),
+        has("qwen3"),
+        has("muse"),
+    ];
+    families.iter().filter(|matched| **matched).count() > 1
+}
+
 /// The repo id recorded by the downloader, when the model came from the
 /// cloud registry; a stronger family signal than a renamed directory.
 fn benchmark_repo_id(model_path: &Path) -> Option<String> {
@@ -85,6 +115,22 @@ pub(crate) fn infer_and_persist_encodings(model_path: &Path) -> Vec<serde_json::
         return vec![];
     };
     let entries = vec![serde_json::json!({ "type": "hanashi", "name": template })];
+
+    // A guess is fine to run on and wrong to write down. Persisting one makes
+    // it permanent — the next launch reads the file instead of re-inferring,
+    // so a model whose name mentions two families would be stuck with
+    // whichever the match order happened to reach first.
+    let source = benchmark_repo_id(model_path).unwrap_or_else(|| dir_name.to_string());
+    if names_more_than_one_family(&source) {
+        tracing::warn!(
+            path = %model_path.display(),
+            template,
+            "model names more than one family; using {template} for this launch but not writing \
+             encoding.json — add one to make the choice explicit"
+        );
+        return entries;
+    }
+
     let serialized = serde_json::Value::Array(entries.clone()).to_string();
     if let Err(error) = fs::write(model_path.join("encoding.json"), &serialized) {
         // Read-only model dirs still work for this launch; we just re-infer
@@ -101,6 +147,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nesting_is_not_ambiguity_but_two_families_are() {
+        // Deliberate nesting: the checkpoint is a Llama derivative with its
+        // own tags, and qwen3.5 contains qwen3.
+        assert!(!names_more_than_one_family("Llama-3.1-FoundationAI-SecurityLLM-8B"));
+        assert!(!names_more_than_one_family("Qwen3.5-0.8B-M"));
+        assert!(!names_more_than_one_family("gemma-3-1b-it-4bit"));
+        // A merge naming two unrelated families is a guess, whatever the
+        // match order says.
+        assert!(names_more_than_one_family("llama-qwen3-merge-7b"));
+        assert!(names_more_than_one_family("gemma-lfm2-distill"));
+    }
+
+    #[test]
     fn infers_known_families() {
         assert_eq!(infer_template("gemma-3-1b-it-4bit"), Some("gemma-3"));
         assert_eq!(infer_template("google/functiongemma-270m-it"), Some("functiongemma"));
@@ -111,6 +170,8 @@ mod tests {
         assert_eq!(infer_template("LiquidAI/LFM2.5-1.2B-Thinking"), Some("lfm2.5-thinking"));
         assert_eq!(infer_template("LiquidAI/LFM2.5-1.2B-Instruct"), Some("lfm2.5-instruct"));
         assert_eq!(infer_template("Llama-3.2-1B-Instruct"), Some("llama-3.2"));
+        assert_eq!(infer_template("Foundation-Sec-8B-Reasoning"), Some("foundation-sec"));
+        assert_eq!(infer_template("Llama-3.1-FoundationAI-SecurityLLM-8B"), Some("foundation-sec"));
         assert_eq!(infer_template("openai_gpt-oss-20b"), Some("gpt-oss"));
     }
 

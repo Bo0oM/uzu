@@ -162,5 +162,9 @@ impl<B: Backend> AttentionCores<B> {
 mod tests;
 
 #[cfg(test)]
+#[path = "../../../../../tests/unit/encodable_block/attention_bench.rs"]
+mod bench;
+
+#[cfg(test)]
 #[path = "../../../../../tests/unit/encodable_block/attention_gemm_test.rs"]
 mod gemm_tests;

@@ -6,6 +6,9 @@ use std::{
 
 use shoji::traits::backend::chat_token::TokenStreamMetrics;
 
+
+
+
 #[cfg(grammar)]
 use crate::engine::language_model::grammar::Grammar;
 use crate::{
@@ -27,6 +30,7 @@ use crate::{
     speculators::{
         Speculator,
         dflash_tfm::{DFlashTfmTreeConstructionMethod, DFlashTfmTreeShape},
+        prompt_lookup::DraftingSchedule,
     },
     trie::TrieNode,
 };
@@ -82,6 +86,10 @@ impl<B: Backend> ForwardPassChaining<B> {
 }
 
 struct DecodingStatePending<B: Backend> {
+    /// Tokens the pass carried. Its GPU time is only comparable within a
+    /// class: a batched pass against a plain one is what decides whether
+    /// drafting pays, and that ratio is a property of the model.
+    batch: u32,
     input_trie: TrieNode,
     full_accept: bool,
     pending: Box<[Pending<B>]>,
@@ -136,23 +144,24 @@ pub struct LanguageModelStream<'a, B: Backend> {
     decoding_state: DecodingState<B>,
     metrics: TokenStreamMetrics,
     /// Prompt-lookup acceptance feedback: drafted passes and tokens accepted
-    /// in the current window; when the window closes with a poor rate,
-    /// spec_cooldown pauses drafting for a stretch of plain passes.
-    spec_window_passes: u32,
-    spec_window_accepted: u32,
-    spec_cooldown: u32,
-    spec_streak: u32,
+    /// The speculator's own schedule, present only when there is one to run.
+    drafting: Option<DraftingSchedule>,
 }
 
 impl<'a, B: Backend> LanguageModelStream<'a, B> {
+
     pub fn new(
         model: &'a LanguageModel<B>,
         input: &[u64],
         model_state: &'a mut LanguageModelState<B>,
         options: LanguageModelStreamOptions,
     ) -> Result<Self, LanguageModelStreamError<B>> {
-        #[cfg(grammar)]
+        // Every path into a stream comes through here — the engine's own
+        // default and a caller-supplied method alike — which is why the
+        // repetition-penalty/window pairing is enforced at this one point
+        // rather than at each place a method is built.
         let mut options = options;
+        model.pair_repetition_penalty_with_a_window(&mut options.sampling_method);
         if model_state.tokens.is_empty() && input.is_empty() {
             return Err(LanguageModelStreamError::NoSeedToken);
         };
@@ -351,6 +360,9 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
             metrics.num_tokens_accepted += 1;
 
             DecodingState::ForwardPassPending(DecodingStatePending {
+                // Prefill is neither class of decode pass; the sample floor
+                // keeps it from skewing the ratio.
+                batch: 1,
                 input_trie: TrieNode::new(0, 0),
                 full_accept: true,
                 pending,
@@ -374,12 +386,8 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
             context_ring,
             decoding_state,
             metrics,
-            spec_window_passes: 0,
-            spec_window_accepted: 0,
-            // Drafting starts paused: the lookup streak has to prove a
-            // verbatim span before the first batched pass is spent.
-            spec_cooldown: u32::MAX,
-            spec_streak: 0,
+            drafting: matches!(model.speculator, Some(Speculator::PromptLookup(_)))
+                .then(DraftingSchedule::default),
         })
     }
 
@@ -404,6 +412,13 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                     )
                 },
                 DecodingState::ForwardPassPending(forward_pass_pending) => {
+                    // A fully accepted pass accepted its whole batch, including
+                    // the one-token batch of a pass that drafted nothing.
+                    if forward_pass_pending.full_accept
+                        && let Some(drafting) = self.drafting.as_mut()
+                    {
+                        drafting.observe_pass(forward_pass_pending.batch, forward_pass_pending.batch);
+                    }
                     if forward_pass_pending.full_accept {
                         self.metrics.num_tokens_returned += 1;
                         (ForwardPassChaining::InFlight(forward_pass_pending), None)
@@ -428,39 +443,20 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
                             (norm, row_bytes)
                         });
                         self.metrics.num_tokens_accepted += full.len();
-                        if matches!(self.model.speculator, Some(Speculator::PromptLookup(_))) {
-                            // Window over drafted passes only (trigram-gated,
-                            // so free prose rarely drafts at all). The full
-                            // m=4 engine pass costs ~3x the m=1 pass (batched
-                            // GEMV is 1.5x, the rest is trie attention,
-                            // 4-row sampling and encode overhead — measured
-                            // via the chat regression at threshold 1.6), so
-                            // a window must average 3 accepted tokens per
-                            // pass to keep drafting; a failed 4-pass probe
-                            // pauses drafting until the lookup-streak signal
-                            // (see full_batch_size) reports a verbatim span,
-                            // bounding chat overhead at one probe per stream.
-                            self.spec_window_passes += 1;
-                            self.spec_window_accepted += full.len() as u32;
+                        if let Some(drafting) = self.drafting.as_mut() {
                             if spec_debug_enabled() {
                                 let proposed: Vec<u64> =
                                     forward_pass_pending.input_trie.linearize().token_ids().collect();
                                 let actual: Vec<u64> = full.iter().map(|(_, _, out)| *out).collect();
                                 eprintln!(
-                                    "SPEC_PASS accepted={} proposed={:?} actual={:?} cooldown={}",
+                                    "SPEC_PASS accepted={} proposed={:?} actual={:?} drafting={}",
                                     full.len(),
                                     proposed,
                                     actual,
-                                    self.spec_cooldown
+                                    drafting.is_drafting()
                                 );
                             }
-                            if self.spec_window_passes == 4 {
-                                if self.spec_window_accepted < 12 {
-                                    self.spec_cooldown = u32::MAX;
-                                }
-                                self.spec_window_passes = 0;
-                                self.spec_window_accepted = 0;
-                            }
+                            drafting.observe_pass(forward_pass_pending.batch, full.len() as u32);
                         }
                         self.decoding_state = DecodingState::Accepting {
                             full,
@@ -604,42 +600,21 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
             None
         };
 
-        let full_batch_size = self.model.speculator.as_ref().map_or(1, |speculator| match speculator {
-            Speculator::DFlash(speculator) => {
+        let full_batch_size = match self.model.speculator.as_ref() {
+            None => 1,
+            Some(Speculator::DFlash(speculator)) => {
                 if speculator.has_weaver() {
                     32
                 } else {
                     16
                 }
             },
-            Speculator::PromptLookup(speculator) => {
-                // A failed probe pauses GPU drafting indefinitely; the pause
-                // ends when the CPU-side lookup lands full-length drafts on
-                // eight consecutive (already known) positions — long enough
-                // that paraphrase-length reuse does not re-enter, only a
-                // genuinely verbatim span. The signal runs a pass behind the
-                // GPU, which is fine for a re-entry trigger.
-                if self.spec_cooldown > 0 {
-                    let tokens = &self.model_state.tokens;
-                    let streak_hit = tokens.len() >= 2
-                        && speculator.would_draft_fully(&tokens[..tokens.len() - 1], tokens[tokens.len() - 1]);
-                    if streak_hit {
-                        self.spec_streak += 1;
-                    } else {
-                        self.spec_streak = 0;
-                    }
-                    if self.spec_streak >= 8 {
-                        self.spec_cooldown = 0;
-                        self.spec_streak = 0;
-                        speculator.batch_size()
-                    } else {
-                        1
-                    }
-                } else {
-                    speculator.batch_size()
-                }
-            },
-        });
+            // The schedule owns when drafting runs; the stream only asks.
+            Some(Speculator::PromptLookup(speculator)) => self
+                .drafting
+                .as_mut()
+                .map_or(1, |drafting| drafting.requested_batch(speculator, &self.model_state.tokens)),
+        };
         let speculation_batch = self
             .model_state
             .max_context_length
@@ -899,6 +874,7 @@ impl<'a, B: Backend> LanguageModelStream<'a, B> {
         }
 
         self.decoding_state = DecodingState::ForwardPassPending(DecodingStatePending {
+            batch: input_flat_trie.len() as u32,
             input_trie,
             full_accept,
             pending: pending.into_boxed_slice(),

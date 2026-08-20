@@ -474,7 +474,29 @@ def convert(
             help="Quantization group size for --quantize-embeddings.",
         ),
     ] = 64,
+    quantize: Annotated[
+        int | None,
+        Option(
+            help=(
+                "Quantize every weight matrix of the model to this bit width (4 or 8), "
+                "the way an external quantizer would. 8 bits keeps the model's answers "
+                "intact and roughly halves weight traffic; 4 bits is faster still but "
+                "starts to move rare tokens such as identifiers."
+            ),
+            show_default="disabled",
+            min=4,
+            max=8,
+        ),
+    ] = None,
+    quantization_group_size: Annotated[
+        int,
+        Option(
+            help="Quantization group size for --quantize.",
+        ),
+    ] = 64,
 ) -> None:
+    if quantize is not None and quantize not in (4, 8):
+        raise Exit(code=2)
     if quantize_embeddings is not None and quantize_embeddings not in (4, 8):
         raise Exit(code=2)
     if output_dir is None:
@@ -488,6 +510,8 @@ def convert(
         partial(CliConversionCallbacks, overwrite=overwrite),
         quantize_embeddings=quantize_embeddings,
         embedding_group_size=embedding_group_size,
+        quantize=quantize,
+        quantization_group_size=quantization_group_size,
     )
 
 

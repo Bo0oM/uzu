@@ -12,7 +12,7 @@ METAL_FUNC float gumbel_noise(uint64_t seed, uint logit_idx) {
   const uint2 offset_word = gumbel_noise_coords(logit_idx);
   PhiloxState rng;
   philox_init(&rng, seed, offset_word.x);
-  const float uniform = float(rng.output[offset_word.y]) * (1.0f / 4294967296.0f);
+  const float uniform = uniform_from_word(rng.output[offset_word.y]);
   return -log(-log(uniform));
 }
 

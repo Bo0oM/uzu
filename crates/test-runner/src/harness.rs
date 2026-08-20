@@ -31,6 +31,18 @@ fn run_with_app_shim(run: impl FnOnce() + Send + 'static) -> ! {
     unreachable!("UIApplicationMain returned")
 }
 
+/// Carries the test payload across the thread boundary the iOS app shim puts
+/// between the harness and the runner.
+///
+/// The payload is always a slice of `'static` top-level functions, so the
+/// wrapper moves references, not data — but that is an argument this file has
+/// to make once, not once per call site.
+#[cfg(target_os = "ios")]
+struct ForceSend<T>(T);
+
+#[cfg(target_os = "ios")]
+unsafe impl<T> Send for ForceSend<T> {}
+
 pub fn uzu_harness(tests: &[&UzuTest]) {
     // Tests and benches must not self-calibrate tiles: calibration skews
     // criterion numbers and slows parity runs. Explicit env still wins.
@@ -54,8 +66,6 @@ pub fn uzu_harness(tests: &[&UzuTest]) {
         if std::env::var_os("UZU_IOS_APP_SHIM").is_some() {
             // The bench closures are 'static top-level functions; the wrapper
             // only carries the references across the thread boundary.
-            struct ForceSend<T>(T);
-            unsafe impl<T> Send for ForceSend<T> {}
             let payload = ForceSend(bench_tests);
             run_with_app_shim(move || {
                 let payload = payload;
@@ -73,8 +83,6 @@ pub fn uzu_harness(tests: &[&UzuTest]) {
             .collect::<Vec<_>>();
         #[cfg(target_os = "ios")]
         if std::env::var_os("UZU_IOS_APP_SHIM").is_some() {
-            struct ForceSend<T>(T);
-            unsafe impl<T> Send for ForceSend<T> {}
             let payload = ForceSend(default_tests);
             run_with_app_shim(move || {
                 let payload = payload;

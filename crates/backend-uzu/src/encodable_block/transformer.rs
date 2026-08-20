@@ -101,6 +101,7 @@ impl<B: Backend> Transformer<B> {
         data_type: DataType,
         transformer_config: &TransformerConfig,
         parameter_tree: &ParameterTree<B>,
+        kv_int8: bool,
     ) -> Result<Self, TransformerNewError<B>> {
         let mut ropes: Vec<AnyRoPEConfig> = Vec::new();
 
@@ -128,6 +129,7 @@ impl<B: Backend> Transformer<B> {
                     layer_index,
                     &layer_loader,
                     data_type,
+                    kv_int8,
                 )?;
 
                 Ok((layer, rope))

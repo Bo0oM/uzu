@@ -114,9 +114,16 @@ inline uint philox_next(thread PhiloxState* state) {
 }
 
 /* Uniform in [2^-24, 1-2^-24]: -log(-log(u)) needs (0,1) — u == 1 gives +inf and wins
- * every argmax. 24 bits only; the full 32 rounds the top 128 values up to 2^32. */
+ * every argmax, u == 0 gives -inf and drops the candidate forever. 24 bits only;
+ * the full 32 rounds the top 128 values up to 2^32. Every draw, whether stepped
+ * through the state or indexed by word, must go through this mapping — the CPU
+ * mirror is `unit_interval` in encodable_block/sampling/gumbel.rs. */
+inline float uniform_from_word(uint word) {
+  return float(metal::max(word >> 8, 1u)) * (1.0f / 16777216.0f);
+}
+
 inline float uniform_float(thread PhiloxState* state) {
-  return float(metal::max(philox_next(state) >> 8, 1u)) * (1.0f / 16777216.0f);
+  return uniform_from_word(philox_next(state));
 }
 
 /* One philox block covers 4 consecutive logits: the gumbel noise of logit e is

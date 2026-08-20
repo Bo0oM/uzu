@@ -159,6 +159,50 @@ unsafe fn dot_full_precision(
     }
 }
 
+/// Everything about a quantized dispatch that does not depend on the column:
+/// the code mask, the midpoint and the sign flip are derived from the bit
+/// width, and the layout strides from the shape. Recomputing them per column
+/// kept the inner loop from specializing on the weight kind.
+struct QuantizedPlan<'a> {
+    weight_data: &'a WeightData,
+    layout: (usize, usize, usize),
+    code_mask: u32,
+    midpoint: f32,
+    sign_flip: u8,
+    bits: usize,
+    group_size: usize,
+}
+
+impl<'a> QuantizedPlan<'a> {
+    fn new(
+        weight_data: &'a WeightData,
+        layout: (usize, usize, usize),
+    ) -> Option<Self> {
+        let WeightData::Quantized {
+            bits,
+            group_size,
+            signed_codes,
+            ..
+        } = weight_data
+        else {
+            return None;
+        };
+        Some(Self {
+            weight_data,
+            layout,
+            code_mask: (1u32 << bits) - 1,
+            midpoint: (1u32 << (bits - 1)) as f32,
+            sign_flip: if *signed_codes {
+                1u8 << (bits - 1)
+            } else {
+                0
+            },
+            bits: *bits,
+            group_size: *group_size,
+        })
+    }
+}
+
 /// # Safety
 ///
 /// Row `b_col` must exist in the quantized weight buffers: codes at
@@ -169,8 +213,7 @@ unsafe fn dot_full_precision(
 #[inline]
 unsafe fn dot_quantized(
     a_row: &[f32],
-    weight_data: &WeightData,
-    layout: (usize, usize, usize),
+    plan: &QuantizedPlan<'_>,
     weights_data_type: DataType,
     b_col: usize,
 ) -> f32 {
@@ -179,23 +222,20 @@ unsafe fn dot_quantized(
         scales,
         zero_points,
         biases,
-        bits,
-        group_size,
-        signed_codes,
-    } = weight_data
+        ..
+    } = plan.weight_data
     else {
         unreachable!();
     };
-    let (num_groups_k, zero_point_stride, pack_factor) = layout;
-    let bits = *bits;
-    let group_size = *group_size;
-    let code_mask = (1u32 << bits) - 1;
-    let midpoint = (1u32 << (bits - 1)) as f32;
-    let sign_flip = if *signed_codes {
-        1u8 << (bits - 1)
-    } else {
-        0
-    };
+    let (num_groups_k, zero_point_stride, pack_factor) = plan.layout;
+    let QuantizedPlan {
+        code_mask,
+        midpoint,
+        sign_flip,
+        bits,
+        group_size,
+        ..
+    } = *plan;
     let k = a_row.len();
 
     let mut accumulator = 0.0f32;
@@ -451,56 +491,76 @@ impl MatmulKernel for MatmulCpuKernel {
                 unsafe { decode_activation_row(&mut activations, a_data, input_data_type, row, k_u) };
             }
 
+            // The weight kind and the quantization constants are fixed for the
+            // whole dispatch, so they are resolved once per chunk instead of
+            // once per column: the inner loop then carries only the dot product
+            // and the epilogue.
             let compute_columns = |columns: std::ops::Range<usize>| unsafe {
-                for row in 0..m_u {
-                    let activation_row = &activations[row * k_u..(row + 1) * k_u];
-                    for col in columns.clone() {
-                        // Gather remaps output column `col` to B-row `gather_indices[row * n + col]`.
-                        let b_col = match gather_ptr {
-                            Some(g) => *g.as_ptr().add(row * n_u + col) as usize,
-                            None => col,
-                        };
-                        debug_assert!(
-                            b_col < b_row_bound,
-                            "gathered B row {b_col} out of range (buffer holds {b_row_bound} rows)"
-                        );
-                        let accumulator = match &weight_data {
-                            WeightData::FullPrecision {
-                                ptr,
-                                leading_dimension,
-                                transpose,
-                            } => dot_full_precision(
-                                activation_row,
-                                ptr.as_ptr(),
-                                weights_data_type,
-                                *leading_dimension,
-                                *transpose,
-                                b_col,
-                            ),
-                            WeightData::Quantized {
-                                ..
-                            } => dot_quantized(
-                                activation_row,
-                                &weight_data,
-                                quant_layout.unwrap(),
-                                weights_data_type,
-                                b_col,
-                            ),
-                        };
-
-                        let output_index = row * n_u + col;
-                        let mut value = output_scale * accumulator;
-                        if accumulate {
-                            value += read_f32(d_ptr.as_ptr(), output_data_type, output_index);
-                        }
-                        if !bias_after_rht && let Some(bias) = bias_ptr {
-                            value += read_f32(bias.as_ptr(), weights_data_type, col);
-                        }
-                        if let Some(cap) = soft_cap {
-                            value = cap * (value / cap).tanh();
-                        }
-                        write_f32(d_ptr.as_ptr(), output_data_type, output_index, value);
+                let epilogue = |row: usize, col: usize, accumulator: f32| {
+                    let output_index = row * n_u + col;
+                    let mut value = output_scale * accumulator;
+                    if accumulate {
+                        value += read_f32(d_ptr.as_ptr(), output_data_type, output_index);
                     }
+                    if !bias_after_rht && let Some(bias) = bias_ptr {
+                        value += read_f32(bias.as_ptr(), weights_data_type, col);
+                    }
+                    if let Some(cap) = soft_cap {
+                        value = cap * (value / cap).tanh();
+                    }
+                    write_f32(d_ptr.as_ptr(), output_data_type, output_index, value);
+                };
+
+                // Gather remaps output column `col` to B-row `gather_indices[row * n + col]`.
+                let b_row_of = |row: usize, col: usize| {
+                    let b_col = match gather_ptr {
+                        Some(g) => *g.as_ptr().add(row * n_u + col) as usize,
+                        None => col,
+                    };
+                    debug_assert!(
+                        b_col < b_row_bound,
+                        "gathered B row {b_col} out of range (buffer holds {b_row_bound} rows)"
+                    );
+                    b_col
+                };
+
+                match &weight_data {
+                    WeightData::FullPrecision {
+                        ptr,
+                        leading_dimension,
+                        transpose,
+                    } => {
+                        let (ptr, leading_dimension, transpose) = (ptr.as_ptr(), *leading_dimension, *transpose);
+                        for row in 0..m_u {
+                            let activation_row = &activations[row * k_u..(row + 1) * k_u];
+                            for col in columns.clone() {
+                                let b_col = b_row_of(row, col);
+                                let accumulator = dot_full_precision(
+                                    activation_row,
+                                    ptr,
+                                    weights_data_type,
+                                    leading_dimension,
+                                    transpose,
+                                    b_col,
+                                );
+                                epilogue(row, col, accumulator);
+                            }
+                        }
+                    },
+                    WeightData::Quantized {
+                        ..
+                    } => {
+                        let plan = QuantizedPlan::new(&weight_data, quant_layout.unwrap())
+                            .expect("quantized weight data carries a quantization plan");
+                        for row in 0..m_u {
+                            let activation_row = &activations[row * k_u..(row + 1) * k_u];
+                            for col in columns.clone() {
+                                let b_col = b_row_of(row, col);
+                                let accumulator = dot_quantized(activation_row, &plan, weights_data_type, b_col);
+                                epilogue(row, col, accumulator);
+                            }
+                        }
+                    },
                 }
             };
 

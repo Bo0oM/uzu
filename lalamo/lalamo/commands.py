@@ -1,3 +1,4 @@
+import math
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -175,6 +176,8 @@ def convert(
     ] = ConversionCallbacks,
     quantize_embeddings: int | None = None,
     embedding_group_size: int = 64,
+    quantize: int | None = None,
+    quantization_group_size: int = 64,
 ) -> None:
     effective_dtype = dtype or DType.BFLOAT16
     callbacks = callbacks_type(
@@ -208,6 +211,8 @@ def convert(
         progress_callback=progress_callback,
     )
     model = imported_model.model
+    if quantize is not None:
+        model = _quantize_weight_matrices(model, bits=quantize, group_size=quantization_group_size)
     if quantize_embeddings is not None:
         model = _quantize_tied_embedding(model, bits=quantize_embeddings, group_size=embedding_group_size)
 
@@ -217,16 +222,49 @@ def convert(
     callbacks.finished_saving_model()
 
 
+def _quantize_weight_matrices(model, *, bits: int, group_size: int):
+    """Quantizes every full-precision weight matrix in the model.
+
+    This is what an external quantizer such as `mlx_lm convert -q` produces,
+    done in one step of the conversion instead of two tools: the projections
+    of every layer, plus the embedding table, move to group-affine integer
+    weights, while normalization scales and anything already compressed are
+    left alone. Matrices whose reduction dim does not divide by the group are
+    skipped rather than regrouped, so the layout the engine expects holds.
+    """
+    from lalamo.compressed import MLXSpec
+    from lalamo.utils.surgery import map_nodes_of_type
+    from lalamo.weight_matrix import FullPrecisionMatrix, WeightMatrix
+
+    def quantize(matrix: WeightMatrix) -> WeightMatrix:
+        if not isinstance(matrix, FullPrecisionMatrix):
+            return matrix
+        if matrix.shape[-1] % group_size != 0:
+            return matrix
+        original = matrix.astype(jnp.float32).decompress()
+        spec = MLXSpec(bits=bits, group_size=group_size, layout=matrix.spec.layout)
+        quantized = spec.compress(
+            original,
+            sharding_config=matrix.sharding_config,
+            is_sharded=matrix.is_sharded,
+        ).astype(matrix.dtype)
+        _reject_degraded_quantization(original, quantized.decompress(), bits=bits, group_size=group_size)
+        return quantized
+
+    return map_nodes_of_type(WeightMatrix, quantize, model)
+
+
 def _quantize_tied_embedding(model, *, bits: int, group_size: int):
     """Quantizes the tied embedding table in place of its full-precision form.
 
     The tied table is read twice per generated token — as the input lookup
     and as the vocab readout matmul — and in bf16 exports it accounts for
     20-32% of all weight traffic (gemma-3-1b: 604 MB per token out of a
-    1.9 GB file). Group-affine int quantization of just this table trades
-    a ~2e-3 max abs error for roughly +7-9% decode throughput on
-    bandwidth-bound devices; the uzu engine loads the quantized table with
-    its existing quantized lookup and readout paths.
+    1.9 GB file). Group-affine int quantization of just this table trades a
+    0.68% RMS weight error (1.7e-3 max abs, measured on Qwen3-0.6B at 8 bits
+    and group 64) for roughly +8% decode throughput on bandwidth-bound
+    devices; the uzu engine loads the quantized table with its existing
+    quantized lookup and readout paths.
     """
     import equinox as eqx
 
@@ -251,12 +289,73 @@ def _quantize_tied_embedding(model, *, bits: int, group_size: int):
         )
 
     spec = MLXSpec(bits=bits, group_size=group_size, layout=matrix.spec.layout)
+    # Quantize from float32. `scale_from_min_max` floors every group scale at
+    # `finfo(weights.dtype).eps`, which is 2^-7 for bfloat16 — larger than the
+    # scale a group of embedding weights actually needs (~5e-4), so a bfloat16
+    # table comes back with every scale clamped and roughly four effective bits
+    # instead of eight. The export dtype is applied when the model is saved.
+    original = matrix.astype(jnp.float32).decompress()
     quantized = spec.compress(
-        matrix.decompress(),
+        original,
         sharding_config=matrix.sharding_config,
         is_sharded=matrix.is_sharded,
-    )
+    ).astype(matrix.dtype)
+    _reject_degraded_quantization(original, quantized.decompress(), bits=bits, group_size=group_size)
     return eqx.tree_at(lambda m: m.decoder.embedding.embedding, model, quantized)
+
+
+def quantization_error_ratio(
+    original: "Float[Array, '*components rows cols']",
+    reconstructed: "Float[Array, '*components rows cols']",
+    *,
+    bits: int,
+    group_size: int,
+) -> float:
+    """How much worse the table came back than the bit width allows.
+
+    A group of `group_size` weights spanning `span` is stored on a grid of
+    `2**bits - 1` steps, so rounding to the nearest step leaves an error of
+    `step / sqrt(12)` — the standard deviation of a uniform distribution over
+    one step. Dividing the achieved error by that floor gives a scale-free
+    number: near 1 means the quantizer used the bits it was given, and a large
+    ratio means it did not (a coarser grid, a clamped scale, a layout the
+    reconstruction does not match).
+    """
+    # The reconstruction comes back in the export dtype; compare in float32 so
+    # the measurement is not itself rounded.
+    original = original.astype(jnp.float32)
+    reconstructed = reconstructed.astype(jnp.float32)
+    groups = original.reshape(*original.shape[:-1], -1, group_size)
+    spans = groups.max(axis=-1) - groups.min(axis=-1)
+    floor_rms = float(jnp.sqrt(jnp.mean(jnp.square(spans / (2**bits - 1)))) / jnp.sqrt(12.0))
+    achieved_rms = float(jnp.sqrt(jnp.mean(jnp.square(reconstructed - original))))
+    if floor_rms == 0.0:
+        return 1.0
+    return achieved_rms / floor_rms
+
+
+# Rounding the scales to the export dtype costs a little over the theoretical
+# floor, so the check has to leave room; three times the floor still catches a
+# quantizer that silently dropped bits (a bfloat16 scale floor once cost four
+# of eight bits and landed at eleven times the floor).
+MAX_QUANTIZATION_ERROR_RATIO = 3.0
+
+
+def _reject_degraded_quantization(
+    original: "Float[Array, '*components rows cols']",
+    reconstructed: "Float[Array, '*components rows cols']",
+    *,
+    bits: int,
+    group_size: int,
+) -> None:
+    ratio = quantization_error_ratio(original, reconstructed, bits=bits, group_size=group_size)
+    if ratio > MAX_QUANTIZATION_ERROR_RATIO:
+        raise ValueError(
+            f"embedding quantization to {bits} bits (group {group_size}) came back "
+            f"{ratio:.1f}x worse than the bit width allows, so the table would carry "
+            f"roughly {bits - math.log2(ratio):.1f} effective bits. Refusing to write a "
+            "model whose quality loss does not match what was asked for."
+        )
 
 
 def convert_speculator(

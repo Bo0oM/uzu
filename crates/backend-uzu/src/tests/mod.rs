@@ -18,3 +18,6 @@ mod model_loading_bench;
 
 #[path = "../../tests/unit/session/device_decode_probe.rs"]
 mod device_decode_probe;
+
+#[path = "../../tests/unit/session/stream_state_test.rs"]
+mod stream_state_test;

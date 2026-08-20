@@ -148,23 +148,28 @@ pub(crate) fn gemv_m_tile(
 /// Per-shape tile overrides produced by the first-launch calibration
 /// (gemv::autotune). Read on every selection; writes happen once per shape
 /// per process.
-static AUTOTUNE_OVERRIDES: std::sync::RwLock<Vec<(u32, u32, GemvTile)>> = std::sync::RwLock::new(Vec::new());
+/// Keyed by the same quadruple the calibration resolves and the on-disk cache
+/// stores. Shape alone is not enough: two models can share `(n, k)` and differ
+/// in scale group, and the winning tile's `packs` is fitted per group.
+type AutotuneKey = (u32, u32, u32, u32);
 
-fn autotune_override(
-    n: u32,
-    k: u32,
-) -> Option<GemvTile> {
-    AUTOTUNE_OVERRIDES.read().ok()?.iter().find(|(on, ok, _)| *on == n && *ok == k).map(|(_, _, tile)| *tile)
+static AUTOTUNE_OVERRIDES: std::sync::RwLock<Vec<(AutotuneKey, GemvTile)>> = std::sync::RwLock::new(Vec::new());
+
+fn autotune_override(key: AutotuneKey) -> Option<GemvTile> {
+    AUTOTUNE_OVERRIDES.read().ok()?.iter().find(|(entry, _)| *entry == key).map(|(_, tile)| *tile)
 }
 
 pub(crate) fn set_autotune_override(
     n: u32,
     k: u32,
+    group_size: u32,
+    bits: u32,
     tile: GemvTile,
 ) {
+    let key = (n, k, group_size, bits);
     if let Ok(mut overrides) = AUTOTUNE_OVERRIDES.write() {
-        overrides.retain(|(on, ok, _)| !(*on == n && *ok == k));
-        overrides.push((n, k, tile));
+        overrides.retain(|(entry, _)| *entry != key);
+        overrides.push((key, tile));
     }
 }
 
@@ -401,6 +406,7 @@ pub(crate) fn quant_tile(
     m: u32,
     n: u32,
     k: u32,
+    group_size: u32,
     bits: u32,
     has_rht: bool,
     tier: DeviceTier,
@@ -411,7 +417,7 @@ pub(crate) fn quant_tile(
         return DEFAULT_TILE;
     }
     let probe = quant_tile_probe();
-    let selected = quant_tile_uncapped(n, k, has_rht, tier, probe);
+    let selected = quant_tile_uncapped(n, k, group_size, bits, has_rht, tier, probe);
     // Every path passes the split cap and the RHT row guard, so probe-forced
     // tiles and future table rows cannot select an invalid split or break the
     // 32-row hadamard invariant.
@@ -422,17 +428,28 @@ pub(crate) fn quant_tile(
             selected.num_simdgroups, selected.k_split, selected.results_per_simdgroup
         );
     }
-    if n < selected.results_per_simdgroup {
+    let mut selected = if n < selected.results_per_simdgroup {
         // Coarse N buckets can include n < R; keep the default R4 tile for tiny rows.
         DEFAULT_TILE
     } else {
         selected
+    };
+    // Single-pack lanes are instantiated for the gs64 slice alone. The table's
+    // `with_packs1` cells are fitted there, and a non-gs64 shape reaching one
+    // used to have its `packs` put back by the dispatcher — which meant the
+    // table said one thing and the dispatch did another. The table answers for
+    // itself now.
+    if selected.packs == 1 && group_size != 64 {
+        selected.packs = 2;
     }
+    selected
 }
 
 fn quant_tile_uncapped(
     n: u32,
     k: u32,
+    group_size: u32,
+    bits: u32,
     has_rht: bool,
     tier: DeviceTier,
     probe: &QuantTileProbe,
@@ -448,7 +465,7 @@ fn quant_tile_uncapped(
     // First-launch autotune winners sit between the sweep probes and the
     // fitted tables: an explicit env probe always wins, a calibrated shape
     // beats the shipped default.
-    if let Some(tuned) = autotune_override(n, k) {
+    if let Some(tuned) = autotune_override((n, k, group_size, bits)) {
         return tuned;
     }
     if has_rht {

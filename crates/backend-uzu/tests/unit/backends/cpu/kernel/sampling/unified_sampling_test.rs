@@ -303,6 +303,38 @@ fn unified_sampling_matches_reference_bf16() {
     }
 }
 
+/// The sampling pipeline carries token indices between its kernels as float
+/// bit patterns (`as_type<float>` on a `float4` lane), and every index below
+/// 2^23 — which is every index in any real vocabulary — is a denormal when
+/// read as a float. The inactive-lane sentinel is a NaN payload for the same
+/// reason. Nothing in the pipeline should do float arithmetic on those lanes,
+/// but if a compiler ever flushes a denormal or canonicalises a NaN on the
+/// way through, the symptom is a silently wrong token rather than an error.
+///
+/// So pick the winner by index rather than by luck: put the peak at indices
+/// whose bit patterns are the awkward ones and check the pipeline returns
+/// exactly them.
+#[uzu_test]
+fn large_token_indices_survive_the_float_lane() {
+    let vocab = 151_936usize;
+    let config = Config {
+        temperature: None,
+        top_k: Some(1),
+        top_p: None,
+        min_p: None,
+        stochastic: false,
+        bitmask: false,
+    };
+
+    for winner in [0usize, 1, 131_072, vocab - 2, vocab - 1] {
+        let mut logits = vec![-20.0f32; vocab];
+        logits[winner] = 20.0;
+        let (actual, expected) = run_both(&logits, None, &[0], config, vocab as u32, 1);
+        assert_eq!(actual, expected, "winner={winner}");
+        assert_eq!(actual, vec![winner as u32], "pipeline lost the index at {winner}");
+    }
+}
+
 #[uzu_test]
 fn unified_sampling_matches_reference_full_vocab() {
     let vocab = 151_936usize;

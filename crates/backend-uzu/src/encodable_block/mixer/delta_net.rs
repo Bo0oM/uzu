@@ -31,6 +31,13 @@ pub(crate) mod tree_verify;
 
 const INNER_DATA_TYPE: DataType = DataType::F32;
 
+/// Largest convolution kernel the decode path can run. The Metal conv-update
+/// kernel caches the state taps in a thread-local `float[CONV_UPDATE_MAX_TAPS]`
+/// (8 entries) and uses one tap per kernel element beyond the first, so a
+/// larger kernel would write past that array. Keep in step with
+/// `CONV_UPDATE_MAX_TAPS` in `metal/kernel/gdn/conv_update.metal`.
+const MAX_CONV_KERNEL_SIZE: u32 = 9;
+
 enum DeltaNetSuffixStatus<B: Backend> {
     Flat {
         suffix_length: u32,
@@ -169,6 +176,12 @@ impl<B: Backend> DeltaNet<B> {
         if config.kernel_size < 2 {
             return Err(DeltaNetNewError::UnsupportedConfiguration(format!(
                 "kernel_size must be >= 2, got {}",
+                config.kernel_size
+            )));
+        }
+        if config.kernel_size > MAX_CONV_KERNEL_SIZE {
+            return Err(DeltaNetNewError::UnsupportedConfiguration(format!(
+                "kernel_size must be <= {MAX_CONV_KERNEL_SIZE}, got {}",
                 config.kernel_size
             )));
         }

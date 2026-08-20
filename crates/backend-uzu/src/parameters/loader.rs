@@ -125,11 +125,28 @@ impl<'a, B: Backend> ParameterLoader<'a, B> {
         })
     }
 
-    /// Whether any tensor ships in an integer dtype. The safetensors header
-    /// is the source of truth for quantization — config.json shows an empty
-    /// quantization block even for quantized exports.
+    /// Whether the transformer weights ship in an integer dtype. The
+    /// safetensors header is the source of truth for quantization —
+    /// config.json shows an empty quantization block even for quantized
+    /// exports.
+    ///
+    /// The embedding table is excluded on purpose. `--quantize-embeddings`
+    /// produces models whose only integer tensor is that table while every
+    /// transformer weight stays bf16; counting it made them look quantized
+    /// and cost them speculative decoding, which is gated on the economics of
+    /// a *dequantizing* batched pass those models never run.
+    ///
+    /// Matched as a prefix, not as the substring "embedding": that would also
+    /// sweep out `decoder.embedding_norm` and `decoder.per_layer_embedding`,
+    /// and the latter is a real per-token weight read on gemma-3n-class
+    /// models — quantizing it would be exactly the case this is meant to see.
     pub fn has_integer_tensors(&self) -> bool {
-        self.index.values().any(|metadata| {
+        const EMBEDDING_TABLE_PREFIX: &str = "decoder.embedding.";
+        self.index
+            .iter()
+            .filter(|(name, _)| !name.starts_with(EMBEDDING_TABLE_PREFIX))
+            .map(|(_, metadata)| metadata)
+            .any(|metadata| {
             matches!(
                 metadata.data_type,
                 DataType::I4
@@ -144,6 +161,16 @@ impl<'a, B: Backend> ParameterLoader<'a, B> {
                     | DataType::U64
             )
         })
+    }
+
+    /// Bytes the weights occupy, from the safetensors header. Decode reads all
+    /// of them once per token, so this is the denominator when deciding whether
+    /// some other traffic — the KV cache, for one — is worth compressing.
+    pub fn total_weight_bytes(&self) -> u64 {
+        // The header's own byte span, not shape times bit width: for a
+        // sub-byte dtype with an odd trailing dimension the latter truncates,
+        // and 4-bit models are exactly the ones this denominator decides for.
+        self.index.values().map(|metadata| metadata.size as u64).sum()
     }
 
     pub fn tree(&self) -> ParameterTree<'_, B> {

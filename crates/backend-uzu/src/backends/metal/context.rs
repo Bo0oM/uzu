@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{
+    sync::{OnceLock, 
         Arc, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
@@ -41,6 +41,10 @@ pub struct MetalContext {
     pipeline_cache: Mutex<HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>>,
     sparse_heap_pool: Mutex<MetalSparseHeapPool>,
     device_tier: DeviceTier,
+    /// Formatted once: this is read on every quantized decode dispatch to key
+    /// the autotune cache, and building it costs a String plus two device
+    /// queries.
+    device_label: OnceLock<String>,
     supports_mxu: bool,
     weak_self: Weak<MetalContext>,
     // Separate from `timeline_event` on purpose: making the hot-path timeline shared costs ~6%
@@ -67,8 +71,8 @@ impl MetalContext {
     }
 
     /// Stable device identity for on-disk calibration caches.
-    pub(crate) fn device_label(&self) -> String {
-        format!("{} ({} cores)", self.device.name(), self.device.gpu_core_count())
+    pub(crate) fn device_label(&self) -> &str {
+        self.device_label.get_or_init(|| format!("{} ({} cores)", self.device.name(), self.device.gpu_core_count()))
     }
 
     pub(super) fn update_peak_memory_usage(&self) {
@@ -197,10 +201,20 @@ impl MetalContext {
         self.timeline_value.fetch_add(1, Ordering::Release)
     }
 
-    /// Clears and returns whether the sparse queue touched the timeline since
-    /// the last work submit.
-    pub(super) fn timeline_take_cross_queue_dirty(&self) -> bool {
-        self.timeline_cross_queue_dirty.swap(false, Ordering::AcqRel)
+    /// Takes a work-queue ticket and reports whether the sparse mapping queue
+    /// touched the timeline since the last submit.
+    ///
+    /// The two must be read together under the same lock the mapping path
+    /// holds. A submit that took its ticket after a mapping took one, but
+    /// before the mapping set the flag, would see it clear and skip the wait
+    /// its work needs — its commands could then run against buffers whose
+    /// remap is still in flight. Single-stream decode never interleaves the
+    /// two, so this only bites with two streams on one context.
+    pub(super) fn take_work_ticket(&self) -> (u64, bool) {
+        let _guard = self.sparse_mapping_lock.lock();
+        let ticket = self.timeline_get_and_increment();
+        let needs_cross_queue_wait = self.timeline_cross_queue_dirty.swap(false, Ordering::AcqRel);
+        (ticket, needs_cross_queue_wait)
     }
 
     pub(super) fn timeline_event(&self) -> &ProtocolObject<dyn MTLEvent> {
@@ -241,6 +255,7 @@ impl Context for MetalContext {
             pipeline_cache: Mutex::new(HashMap::new()),
             sparse_heap_pool: Mutex::new(sparse_pool),
             device_tier,
+            device_label: OnceLock::new(),
             supports_mxu,
             weak_self: weak_self.clone(),
             sparse_mapping_event,

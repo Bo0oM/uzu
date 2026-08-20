@@ -21,7 +21,10 @@ const MXU_N_BUCKET_MAXES: [u32; 2] = [63, 127];
 
 const SIMDGROUP_QUANT_SMALL_M_MAX: u32 = 32;
 const SIMDGROUP_QUANT_LARGE_M_MIN: u32 = 64;
-const SIMDGROUP_QUANT_WIDE_N_MIN: u32 = 6144;
+
+/// The 64x64x32 tile needs whole 64-column blocks; a narrower or unaligned n
+/// leaves lanes idle, and the smaller tile wins there.
+const SIMDGROUP_QUANT_WIDE_TILE_N_ALIGNMENT: u32 = 64;
 
 const SPLIT_K_TARGET_TILES_FP: u32 = 512;
 const SPLIT_K_TARGET_TILES_A8: u32 = 256;
@@ -104,7 +107,7 @@ pub(super) fn simdgroup_quant_tile(
         GemmTiling::Tile64x64x16_Simdgroups2x2
     } else if m < SIMDGROUP_QUANT_SMALL_M_MAX {
         GemmTiling::Tile8x32x32_Simdgroups1x1
-    } else if m >= SIMDGROUP_QUANT_LARGE_M_MIN && n >= SIMDGROUP_QUANT_WIDE_N_MIN && n.is_multiple_of(64) {
+    } else if m >= SIMDGROUP_QUANT_LARGE_M_MIN && n.is_multiple_of(SIMDGROUP_QUANT_WIDE_TILE_N_ALIGNMENT) {
         GemmTiling::Tile64x64x32_Simdgroups2x2
     } else {
         GemmTiling::Tile32x32x32_Simdgroups2x2

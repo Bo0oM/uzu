@@ -88,6 +88,19 @@ SDK than the default deployment target.
 
 Key flags:
 
+- `DINGHY_SKIP_APPLE_HOST=1` — **required for this crate**, on both `test`
+  and `bench`. Without it dinghy regenerates a host crate that compiles
+  our sources into its own, so `include!(concat!(env!("OUT_DIR"),
+  "/traits.rs"))` in `backends/common/kernel/mod.rs` resolves to the
+  runner's `OUT_DIR`, where our build script never ran. The build fails
+  with `couldn't find file .../dinghy-generated-apple-runner/.../traits.rs`
+  after a full iOS compile, so the cost of forgetting it is about fifteen
+  minutes. With the flag set, dinghy packages the already-built binary
+  instead.
+- `-e UZU_IOS_APP_SHIM=1` — on-device env var that runs the harness
+  inside a UIApplication. Without it the iOS watchdog kills anything
+  long-running (criterion in particular) with SIGKILL.
+
 - `-e CRITERION_HOME=criterion/a19` — on-device env var. Path is
   relative to the app's cwd (`Documents/`), so this becomes
   `Documents/criterion/a19/` on device. Keep it directly under
@@ -100,10 +113,69 @@ Key flags:
   cargo runner is launched with cwd set to the package dir, not the
   workspace root.
 
+Running the test suite on device follows the same shape:
+
+```bash
+DEVICE=$(xcrun devicectl list devices | awk '/iPhone/ {print $3; exit}')
+
+IPHONEOS_DEPLOYMENT_TARGET=26.4 DINGHY_SKIP_APPLE_HOST=1 cargo dinghy \
+  -d "$DEVICE" -e UZU_IOS_APP_SHIM=1 \
+  test -p backend-uzu --lib -- --nocapture
+```
+
+One test fails there and is expected to: `test_metadata_loading` opens
+the test model's weights, which are not synced to the device. Everything
+else passes, including the two paths that cannot run on M1 Max at all --
+`MetalDeltaNetChunkedPrefill` and the `NATIVE_INT8_MATMUL` activation
+path -- both verified on A19 on 2026-08-19.
+
+### End-to-end decode on device
+
+The per-model numbers in the README come from `device_decode_probe`, not
+from criterion. It needs three things, and the third is easy to miss:
+
+- `[test_data]` in `.dinghy.toml` names the model to ship. Only one model
+  fits per run, so a sweep rewrites the file between models. The value is
+  a host path; dinghy copies the directory into the bundle.
+- `-e UZU_DEVICE_DECODE_PROBE=1` — the probe returns immediately without
+  it, so the regular suite does not pay for a model load.
+- `-e UZU_TEST_MODEL_DIR=test_data/model` — **required**. `copy_test_data`
+  puts the directory at `<bundle>/test_data/<key>`, and the probe resolves
+  a relative `UZU_TEST_MODEL_DIR` against the executable's directory.
+  Without it `get_test_model_path` falls through to the host-side
+  `workspace/models/<version>/` branch, which does not exist on the phone,
+  and the run fails in `test-runner/src/path.rs` after the whole model has
+  already been copied over USB.
+
+```bash
+DEVICE=$(xcrun devicectl list devices | awk '/iPhone/ {print $3; exit}')
+
+IPHONEOS_DEPLOYMENT_TARGET=26.4 DINGHY_SKIP_APPLE_HOST=1 cargo dinghy \
+  -d "$DEVICE" \
+  -e UZU_IOS_APP_SHIM=1 \
+  -e UZU_DEVICE_DECODE_PROBE=1 \
+  -e UZU_TEST_MODEL_DIR=test_data/model \
+  test -p backend-uzu --lib --release device_decode_probe -- --nocapture
+```
+
+Discard the first run of a model: the tile autotune calibrates on first
+launch and the file cache is cold, which shows up in `ttft_ms` (365 ms
+against 171 ms on the second gemma-3-1b-it-4bit run) more than in
+`decode_tps`.
+
+`UZU_PROBE_DECODE` sets the decode length and **defaults to 64, while the
+published tables are measured at 256**. The two are not comparable, so set
+it explicitly on every run that is going into a table and check
+`decode_tokens=` in the output line, which is the only place the length is
+recorded once the number has been copied into a table. Speculation and the
+tile autotune stay on: they are what ships, and upstream has neither, so
+leaving them on is what makes the comparison the one a reader cares
+about.
+
 ```bash
 DEVICE=<DEVICE_ID>
 
-IPHONEOS_DEPLOYMENT_TARGET=26.4 cargo dinghy \
+IPHONEOS_DEPLOYMENT_TARGET=26.4 DINGHY_SKIP_APPLE_HOST=1 cargo dinghy \
   -d "$DEVICE" \
   -e CRITERION_HOME=criterion/a19 \
   --sync-dirs "$(pwd)/target/criterion=Documents/criterion" \

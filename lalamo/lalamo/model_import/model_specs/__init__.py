@@ -12,6 +12,7 @@ from .bonsai import BONSAI_MODELS
 from .deepseek import DEEPSEEK_MODELS
 from .essential_ai import RNJ_MODELS
 from .fishaudio import FISHAUDIO_TTS_MODELS
+from .foundation_sec import FOUNDATION_SEC_MODELS
 from .gemma import GEMMA_MODELS
 from .gpt_oss import GPT_OSS_MODELS
 from .granite import GRANITE_MODELS
@@ -42,6 +43,7 @@ __all__ = [
 TTS_MODELS = FISHAUDIO_TTS_MODELS
 
 ALL_MODEL_LISTS = [
+    FOUNDATION_SEC_MODELS,
     GRANITE_MODELS,
     LFM2_MODELS,
     LLAMA_MODELS,

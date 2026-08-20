@@ -89,11 +89,12 @@ impl<B: Backend> dyn Mixer<B> {
         config: &AnyTokenMixerConfig,
         parameter_tree: &ParameterTree<B>,
         context: &B::Context,
+        kv_int8: bool,
     ) -> Result<(Box<dyn Mixer<B>>, Option<Allocation<B>>), MixerNewError<B>> {
         match config {
             AnyTokenMixerConfig::AttentionConfig(config) => {
                 let (attention, in_projection_input_hadamard_factors) =
-                    Attention::new(hidden_dim, data_type, rope_config, config, parameter_tree, context)?;
+                    Attention::new(hidden_dim, data_type, rope_config, config, parameter_tree, context, kv_int8)?;
 
                 Ok((Box::new(attention), in_projection_input_hadamard_factors))
             },

@@ -13,21 +13,12 @@ use crate::{
 
 pub(crate) const ATTENTION_SUFFIX_CAPACITY: u32 = 1024; // TODO: remove hardcoded suffix capacity
 
-/// Head dims above one 256-thread group cannot reduce their absmax inside
-/// the prepare kernel, so they keep the bf16 cache.
-pub(crate) const KV_INT8_MAX_HEAD_DIM: u32 = 256;
-
-/// Opt-in int8 KV cache (symmetric absmax per (token, kv head)); see ADR-8.
-pub(crate) fn kv_int8_eligible(
-    head_dim: u32,
-    data_type: DataType,
-) -> bool {
-    kv_cache_int8_enabled() && head_dim <= KV_INT8_MAX_HEAD_DIM && matches!(data_type, DataType::BF16 | DataType::F16)
-}
-
-pub(crate) fn kv_cache_int8_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("UZU_KV_INT8").is_some())
+/// Explicit `UZU_KV_INT8` setting, when there is one: `0` forces the exact
+/// cache, anything else forces int8. Without it the engine decides per model
+/// from how much of the per-token traffic the cache accounts for.
+pub(crate) fn kv_cache_int8_override() -> Option<bool> {
+    static SETTING: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *SETTING.get_or_init(|| std::env::var("UZU_KV_INT8").ok().map(|value| value != "0"))
 }
 
 pub enum AttentionStateType {
@@ -129,7 +120,10 @@ impl<B: Backend> AttentionState<B> {
         let max_elements = max_prefix_elements + ATTENTION_SUFFIX_CAPACITY;
         let num_kv_heads = attention.num_kv_heads.unwrap();
         let element_size = num_kv_heads * attention.head_dim;
-        let kv_int8 = kv_int8_eligible(attention.head_dim, data_type);
+        // The layer already decided this and built its kernels around the
+        // answer; deriving it a second time here is how a cache the prepare
+        // kernel cannot write ended up being allocated.
+        let kv_int8 = attention.kv_int8;
         let cache_data_type = if kv_int8 {
             DataType::U8
         } else {

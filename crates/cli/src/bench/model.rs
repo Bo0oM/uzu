@@ -66,5 +66,14 @@ pub struct BenchResult {
     pub generate_tokens_per_second: Option<f64>,
     pub power_stats: Option<ChatReplyPowerStats>,
     pub joules_per_token: Option<f64>,
+    /// Accepted tokens per decode pass. Plain decoding sits at 1.0; with
+    /// speculation this is what has to clear the batched pass's cost ratio for
+    /// the run to have gained anything, so it belongs next to the throughput.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_per_forward_pass: Option<f64>,
     pub text: String,
+    /// Reasoning models spend most of a run inside the thinking block; without
+    /// this a run that never closed it is recorded as an empty answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }

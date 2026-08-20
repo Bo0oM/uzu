@@ -94,12 +94,20 @@ impl BenchRunner {
                 }
             }
 
+            let tokens_per_forward_pass = replies
+                .iter()
+                .filter_map(|reply| reply.stats.speculator_stats.as_ref())
+                .map(|stats| stats.tokens_per_forward_pass)
+                .next_back();
             let mut text: Option<String> = None;
+            let mut reasoning: Option<String> = None;
             if !replies.is_empty() {
                 let replies_count = replies.len() as f64;
                 time_to_first_token /= replies_count;
                 prompt_tokens_per_second /= replies_count;
-                text = replies.last().unwrap().message.text();
+                let message = &replies.last().unwrap().message;
+                text = message.text();
+                reasoning = message.reasoning();
             }
             let generate_tokens_per_second = mean(&generate_tokens_per_second);
 
@@ -125,7 +133,9 @@ impl BenchRunner {
                 generate_tokens_per_second,
                 power_stats,
                 joules_per_token,
+                tokens_per_forward_pass,
                 text: text.unwrap_or("".to_string()),
+                reasoning,
             };
             results.push(result);
 

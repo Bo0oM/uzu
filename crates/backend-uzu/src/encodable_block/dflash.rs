@@ -145,6 +145,9 @@ impl<B: Backend> DFlash<B> {
                     index,
                     &layers_tree.subtree(&index.to_string()),
                     data_type,
+                    // The draft model keeps a bf16 cache: its own decode is a
+                    // rounding error next to the target model's.
+                    false,
                 )
             })
             .collect::<Result<Box<[_]>, TransformerLayerError<B>>>()?;

@@ -49,7 +49,13 @@ fn quant_policy_cases() {
     ];
 
     for (tier, m, n, k, bits, has_rht, expected) in cases {
-        assert_eq!(quant_tile(m, n, k, bits, has_rht, tier), expected, "tier={tier:?} m={m} n={n} k={k} bits={bits}");
+        // Group 64 throughout: these rows exercise the fitted tables, which
+        // are keyed on shape, not on the scale group.
+        assert_eq!(
+            quant_tile(m, n, k, 64, bits, has_rht, tier),
+            expected,
+            "tier={tier:?} m={m} n={n} k={k} bits={bits}"
+        );
     }
 }
 

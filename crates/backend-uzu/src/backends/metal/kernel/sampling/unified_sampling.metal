@@ -11,6 +11,28 @@
 
 #define MAX_ITERS 64
 
+// The pipeline carries token indices and counts between its stages on the same
+// float4 lanes as the logit values. They used to travel as bit patterns, which
+// made every index below 2^23 a denormal and the inactive-lane marker a NaN
+// payload — correct only for as long as nothing on the path flushes a denormal
+// or canonicalises a NaN, and wrong by a silently different token if anything
+// ever does.
+//
+// A float holds every integer below 2^24 exactly, and a vocabulary is far
+// smaller than that, so the value itself rides the lane and the round trip is
+// exact by arithmetic rather than by bit preservation. The marker is a
+// negative number, which no count or index can be.
+constant float INACTIVE_LANE = -1.0f;
+
+static inline float lane_from_index(uint32_t index) {
+  return float(index);
+}
+
+static inline uint32_t index_from_lane(float lane) {
+  return uint32_t(metal::max(lane, 0.0f));
+}
+
+
 // The vocab is walked in units of the shared gumbel noise block (rng.h), so
 // the sliced kernels below and the serial tail all draw identical noise.
 #define ELEMS_PER_NOISE_BLOCK GUMBEL_ELEMS_PER_NOISE_BLOCK
@@ -272,7 +294,7 @@ KERNEL(SamplingPartialScan)(
         pre_filter_logit_max,
         pre_filter_logit_norm,
         post_gumbel_logit_max.value,
-        as_type<float>(post_gumbel_logit_max.index)
+        lane_from_index(post_gumbel_logit_max.index)
     );
   }
 }
@@ -295,19 +317,19 @@ KERNEL(SamplingCombine)(
   const bool active = lane < num_slices;
   const float4 partial = active
       ? partials[batch_idx * num_slices + lane]
-      : float4(-INFINITY, 0.0, -INFINITY, as_type<float>(numeric_limits<uint32_t>::max()));
+      : float4(-INFINITY, 0.0, -INFINITY, INACTIVE_LANE);
 
   const float pre_filter_logit_max = simd_max(partial.x);
   float pre_filter_logit_norm = 0.0;
   if (has_top_p) {
     pre_filter_logit_norm = simd_sum(partial.y != 0.0 ? partial.y * exp(partial.x - pre_filter_logit_max) : 0.0);
   }
-  const Logit candidate = SimdReduceMaxLogit::simd_reduce(Logit{partial.z, as_type<uint32_t>(partial.w)});
+  const Logit candidate = SimdReduceMaxLogit::simd_reduce(Logit{partial.z, index_from_lane(partial.w)});
 
   if (lane == 0) {
     if (has_filters) {
       state[batch_idx] =
-          float4(candidate.value, as_type<float>(candidate.index), pre_filter_logit_max, pre_filter_logit_norm);
+          float4(candidate.value, lane_from_index(candidate.index), pre_filter_logit_max, pre_filter_logit_norm);
     } else {
       output[batch_idx] = candidate.index;
     }
@@ -355,7 +377,7 @@ KERNEL(SamplingLoopPartial)(
   }
 
   const float4 batch_state = state[batch_idx];
-  Logit candidate_logit_pre_filter = Logit::load(logits, as_type<uint32_t>(batch_state.y));
+  Logit candidate_logit_pre_filter = Logit::load(logits, index_from_lane(batch_state.y));
   if (has_temperature) {
     candidate_logit_pre_filter.value *= recip_temperature;
   }
@@ -384,10 +406,10 @@ KERNEL(SamplingLoopPartial)(
 
   if (thread_idx == 0) {
     partials[batch_idx * num_slices + slice_idx] = float4(
-        as_type<float>(stats.num_above),
+        float(stats.num_above),
         stats.mass_above,
         stats.next_candidate_post_gumbel.value,
-        as_type<float>(stats.next_candidate_post_gumbel.index)
+        lane_from_index(stats.next_candidate_post_gumbel.index)
     );
   }
 }
@@ -441,7 +463,7 @@ KERNEL(SamplingFinalize)(
   }
 
   const float4 batch_state = state[batch_idx];
-  Logit candidate_logit_post_gumbel = {batch_state.x, as_type<uint32_t>(batch_state.y)};
+  Logit candidate_logit_post_gumbel = {batch_state.x, index_from_lane(batch_state.y)};
   const float pre_filter_logit_max = batch_state.z;
   const float pre_filter_logit_norm = batch_state.w;
 
@@ -451,21 +473,21 @@ KERNEL(SamplingFinalize)(
     const bool active = thread_context.simd_lane_id < num_slices;
     const float4 partial = active
         ? loop_partials[batch_idx * num_slices + thread_context.simd_lane_id]
-        : float4(as_type<float>(0u), 0.0, -INFINITY, as_type<float>(numeric_limits<uint32_t>::max()));
-    const uint32_t num_above = simd_sum(as_type<uint32_t>(partial.x));
+        : float4(0.0f, 0.0, -INFINITY, INACTIVE_LANE);
+    const uint32_t num_above = uint32_t(simd_sum(partial.x));
     const float mass_above = simd_sum(partial.y);
-    const Logit next = SimdReduceMaxLogit::simd_reduce(Logit{partial.z, as_type<uint32_t>(partial.w)});
+    const Logit next = SimdReduceMaxLogit::simd_reduce(Logit{partial.z, index_from_lane(partial.w)});
     if (thread_context.simd_lane_id == 0) {
-      shared_scalars[0] = as_type<float>(num_above);
+      shared_scalars[0] = float(num_above);
       shared_scalars[1] = mass_above;
       shared_scalars[2] = next.value;
-      shared_scalars[3] = as_type<float>(next.index);
+      shared_scalars[3] = lane_from_index(next.index);
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  uint32_t num_above_candidate = as_type<uint32_t>(shared_scalars[0]);
+  uint32_t num_above_candidate = uint32_t(shared_scalars[0]);
   float mass_above_candidate = shared_scalars[1];
-  Logit next_candidate_logit_post_gumbel = {shared_scalars[2], as_type<uint32_t>(shared_scalars[3])};
+  Logit next_candidate_logit_post_gumbel = {shared_scalars[2], index_from_lane(shared_scalars[3])};
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   for (uint32_t iteration = 0; iteration < MAX_ITERS; iteration++) {

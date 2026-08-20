@@ -267,7 +267,7 @@ impl CommandBufferExecutable for MetalCommandBufferExecutable {
 
     fn submit(self) -> MetalCommandBufferPending {
         let cmd_queue = self.command_buffer.command_queue();
-        let wait_value = self.context.timeline_get_and_increment();
+        let (wait_value, needs_cross_queue_wait) = self.context.take_work_ticket();
 
         // Same-queue command buffers already execute in commit order with
         // automatic hazard tracking, so the cross-queue wait is only needed
@@ -275,7 +275,7 @@ impl CommandBufferExecutable for MetalCommandBufferExecutable {
         // submit. The signal rides on the work buffer itself; the old
         // three-buffer sandwich cost two extra commits per submit, which
         // dominates short decode tokens on iOS (ADR-10).
-        if self.context.timeline_take_cross_queue_dirty() {
+        if needs_cross_queue_wait {
             let cmd_buffer = cmd_queue.command_buffer().expect("Failed to create command buffer");
             cmd_buffer.set_label(Some("sync (wait)"));
             cmd_buffer.encode_wait_for_event_value(self.context.timeline_event(), wait_value);

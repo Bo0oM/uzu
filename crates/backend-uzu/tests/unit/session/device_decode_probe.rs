@@ -6,6 +6,40 @@ use std::time::Instant;
 use proc_macros::uzu_test;
 use test_runner::path::get_test_model_path;
 
+/// How hot the device thinks it is, as `NSProcessInfo.thermalState`.
+///
+/// The desktop stand gates on temperature before it measures; the phone has
+/// nothing equivalent, and a run does not look any different for being taken
+/// on a hot device. It costs about 10%: LFM2-350M reads 100.3 t/s on a rested
+/// A19 and 91 after an hour of back-to-back runs, which is how a sweep whose
+/// last model is measured on the hottest phone reports a regression that is
+/// not there. Reporting the state does not stop that, but it does mean the
+/// number carries the evidence with it.
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+fn thermal_state() -> &'static str {
+    use objc2::{class, msg_send, runtime::AnyObject};
+    // NSProcessInfoThermalState: nominal, fair, serious, critical.
+    let state: isize = unsafe {
+        let info: *mut AnyObject = msg_send![class!(NSProcessInfo), processInfo];
+        if info.is_null() {
+            return "unknown";
+        }
+        msg_send![info, thermalState]
+    };
+    match state {
+        0 => "nominal",
+        1 => "fair",
+        2 => "serious",
+        3 => "critical",
+        _ => "unknown",
+    }
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+fn thermal_state() -> &'static str {
+    "unknown"
+}
+
 /// iOS/macOS peak process footprint (the number the OS shows as app memory),
 /// mirroring the trymirai metrics-page "Resident memory" definition.
 #[cfg(any(target_os = "ios", target_os = "macos"))]
@@ -119,16 +153,27 @@ fn device_decode_probe() {
         }
         let generated = output_ids.len();
         let decode_tps = (generated.saturating_sub(1)) as f64 / decode.as_secs_f64();
+        // Accepted tokens per decode pass: 1.0 means speculation never landed,
+        // and what it has to clear to pay for itself is the cost of the batched
+        // pass on this device — the reason a threshold tuned on a Mac cannot be
+        // assumed to hold on an A19.
+        let metrics = stream.metrics();
+        let accepted_per_pass = if metrics.num_decode_forward_passes > 0 {
+            metrics.num_tokens_accepted as f64 / metrics.num_decode_forward_passes as f64
+        } else {
+            0.0
+        };
         #[cfg(any(target_os = "ios", target_os = "macos"))]
         let footprint_mib = phys_footprint_bytes().map(|bytes| bytes as f64 / (1024.0 * 1024.0)).unwrap_or(-1.0);
         #[cfg(not(any(target_os = "ios", target_os = "macos")))]
         let footprint_mib = -1.0f64;
         println!(
-            "DEVICE_DECODE_PROBE model={} load_ms={:.0} prefill_tokens={} ttft_ms={:.1} decode_tokens={generated} decode_tps={decode_tps:.2} footprint_mib={footprint_mib:.0}",
+            "DEVICE_DECODE_PROBE model={} load_ms={:.0} prefill_tokens={} ttft_ms={:.1} decode_tokens={generated} decode_tps={decode_tps:.2} accepted_per_pass={accepted_per_pass:.3} footprint_mib={footprint_mib:.0} thermal={}",
             model_path.file_name().unwrap().to_string_lossy(),
             load.as_secs_f64() * 1e3,
             input.len(),
             prefill.as_secs_f64() * 1e3,
+            thermal_state(),
         );
         println!(
             "DEVICE_DECODE_IDS {}",

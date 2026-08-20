@@ -59,6 +59,27 @@ fn top_children<B: Backend>(
     (allocation_to_vec(&output_token_ids), allocation_to_vec(&output_model_logprobs))
 }
 
+/// With every candidate carrying the same logit the selection is decided by the
+/// gumbel noise alone, which pins the (seed, index) -> word mapping across
+/// backends: draw the wrong word for a token and the children change. Note what
+/// this cannot see — a change to the word -> unit-interval mapping that stays
+/// monotone leaves the ranking, and so this test, untouched.
+#[uzu_test]
+fn weaver_top_children_noise_parity_on_flat_logits() {
+    const ROWS: usize = 3;
+    let residual = vec![bf16::from_f32(0.0); ROWS * CANDIDATES];
+    let candidate_logits = vec![0.0f32; ROWS * CANDIDATES];
+    let ids = (0..ROWS)
+        .flat_map(|row| (0..CANDIDATES).map(move |index| (row * CANDIDATES + index) as u32))
+        .collect::<Vec<_>>();
+
+    for_each_non_cpu_backend!(|B| {
+        let expected = top_children::<Cpu>(&residual, &candidate_logits, &ids);
+        let actual = top_children::<B>(&residual, &candidate_logits, &ids);
+        assert_eq!(actual.0, expected.0, "children selected by noise diverge from the CPU draw");
+    });
+}
+
 #[uzu_test]
 fn weaver_top_children_matches_cpu() {
     const ROWS: usize = 3;

@@ -55,6 +55,7 @@ impl<B: Backend> Decoder<B> {
         config: &DecoderConfig,
         parameter_tree: &ParameterTree<B>,
         data_type: DataType,
+        kv_int8: bool,
     ) -> Result<Self, DecoderError<B>> {
         let (embedding, readout_input_hadamard_factors) = Embedding::new(
             context,
@@ -105,6 +106,7 @@ impl<B: Backend> Decoder<B> {
             data_type,
             &config.transformer_config,
             &parameter_tree.subtree("transformer"),
+            kv_int8,
         )?;
 
         Ok(Self {

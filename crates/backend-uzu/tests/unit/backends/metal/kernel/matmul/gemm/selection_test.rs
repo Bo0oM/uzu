@@ -76,9 +76,14 @@ fn policy_boundaries_are_preserved() {
         assert_eq!(policy::mxu_fp_tile(m, n, k), expected);
     }
 
+    // What decides the wide tile is whether n divides into whole 64-column
+    // blocks, not how large n is. Requiring n >= 6144 as well used to send
+    // every projection narrower than that to the small tile, which cost 9.8%
+    // of gemma-3-1b-4bit prefill; 1152 is that model's down projection.
     for (m, n, group_size, expected) in [
         (16, 4096, 31, Tile64x64x16_Simdgroups2x2),
         (31, 4096, 32, Tile8x32x32_Simdgroups1x1),
+        (64, 1152, 32, Tile64x64x32_Simdgroups2x2),
         (64, 6143, 32, Tile32x32x32_Simdgroups2x2),
         (64, 6144, 32, Tile64x64x32_Simdgroups2x2),
     ] {

@@ -27,11 +27,31 @@ use crate::{
 pub(crate) mod core;
 mod mode;
 mod qkv_norm;
-mod state;
+pub(crate) mod state;
 
 pub(crate) use state::{ATTENTION_SUFFIX_CAPACITY, AttentionState, AttentionStateType};
 
 pub mod rope;
+
+/// Head dims above one 256-thread group cannot reduce their absmax inside
+/// the prepare kernel, so they keep the bf16 cache.
+const KV_INT8_MAX_HEAD_DIM: u32 = 256;
+
+/// Whether an int8 KV cache is possible for this layer at all; see ADR-8.
+///
+/// Private on purpose, and private here rather than next to the state: this
+/// is the only place allowed to answer the question, because it is also the
+/// place that builds the kernels around the answer. A second caller deriving
+/// it independently is exactly how the state once allocated a quantized cache
+/// that the layer had no kernel to write.
+fn kv_int8_eligible(
+    head_dim: u32,
+    data_type: DataType,
+) -> bool {
+    state::kv_cache_int8_override().unwrap_or(true)
+        && head_dim <= KV_INT8_MAX_HEAD_DIM
+        && matches!(data_type, DataType::BF16 | DataType::F16)
+}
 
 pub struct Attention<B: Backend> {
     head_dim: u32,
@@ -41,6 +61,10 @@ pub struct Attention<B: Backend> {
     sliding_window_size: Option<u32>,
     max_rope_length: Option<u32>,
     data_type: DataType,
+    /// Whether the KV cache this layer reads is int8. The state must not
+    /// re-derive it: the kernels below are built for this answer, and a state
+    /// that decided otherwise would hand them a cache they cannot read.
+    pub(crate) kv_int8: bool,
     qkv: LinearProjection<B>,
     prepare: <B::Kernels as Kernels>::AttentionPrepareKernel,
     prepare_kv_q8: Option<<B::Kernels as Kernels>::AttentionPrepareKernel>,
@@ -72,6 +96,7 @@ impl<B: Backend> Attention<B> {
         config: &AttentionConfig,
         parameter_tree: &ParameterTree<B>,
         context: &B::Context,
+        kv_int8_requested: bool,
     ) -> Result<(Self, Option<Allocation<B>>), AttentionNewError<B>> {
         let is_kv_sharing = config.is_kv_sharing;
 
@@ -166,7 +191,7 @@ impl<B: Backend> Attention<B> {
         // q8 core variants matching its owner's quantized cache. Only the
         // WRITE side (the q8 prepare) is skipped for sharing layers: the
         // owner appends the KV.
-        let kv_int8 = state::kv_int8_eligible(head_dim, data_type);
+        let kv_int8 = kv_int8_requested && kv_int8_eligible(head_dim, data_type);
         let prepare_kv_q8 = (kv_int8 && !is_kv_sharing)
             .then(|| {
                 <B::Kernels as Kernels>::AttentionPrepareKernel::new(
@@ -251,6 +276,7 @@ impl<B: Backend> Attention<B> {
                     norm: qkv_norm,
                 },
                 prepare,
+                kv_int8,
                 prepare_kv_q8,
                 gate_projection,
                 sinks,

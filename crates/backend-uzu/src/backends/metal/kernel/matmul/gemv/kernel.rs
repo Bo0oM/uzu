@@ -10,7 +10,7 @@ use super::{
 use crate::{
     backends::{
         common::{
-            Allocation, BufferArg, Encoder,
+            Allocation, AllocationType, AsBufferRangeRef, BufferArg, Context, Encoder,
             gpu_types::{
                 HADAMARD_TRANSFORM_BLOCK_SIZE,
                 gemm::{GemmBPrologueKind, GemmDTransform},
@@ -96,11 +96,6 @@ impl GemvSpecialization {
             policy::fp_values_per_thread(shape.k, device_tier)
         };
         let group_size = shape.b_group_size.unwrap_or(0);
-        let tile_precheck_packs = if is_quant && bits == 4 && group_size == 64 {
-            None // resolved from the tile below
-        } else {
-            Some(2)
-        };
         let input_aligned_for = |packs: u32| {
             let block_size = if !is_quant {
                 policy::fp_k_block(values_per_thread)
@@ -113,7 +108,7 @@ impl GemvSpecialization {
         let has_rht = shape.d_transform.contains(GemmDTransform::RHT);
         let bf16_io = input_data_type == DataType::BF16 && output_data_type == DataType::BF16;
         let tile = if is_quant && bf16_io {
-            policy::quant_tile(shape.m, shape.n, shape.k, bits, has_rht, device_tier)
+            policy::quant_tile(shape.m, shape.n, shape.k, group_size, bits, has_rht, device_tier)
         } else if is_quant || has_rht {
             // Non-bf16 quant IO and fp+RHT keep the default tile (the only
             // one instantiated for those modes).
@@ -140,14 +135,13 @@ impl GemvSpecialization {
         } else {
             1
         };
-        let packs = if m_tile > 1 && is_quant {
+        // A batched quantized pass always takes single-pack lanes; otherwise
+        // the tile decides, and the policy only offers `packs == 1` where that
+        // slice is instantiated.
+        let packs = if (m_tile > 1 && is_quant) || tile.packs == 1 {
             1
         } else {
-            tile_precheck_packs.unwrap_or(if tile.packs == 1 {
-                1
-            } else {
-                2
-            })
+            2
         };
         let input_aligned = input_aligned_for(packs);
         // Mirrors the MT constraint in gemv.metal: only the 4-bit bf16
@@ -215,7 +209,7 @@ impl GemvDispatch {
         }
     }
 
-    fn get_or_create(
+    pub(crate) fn get_or_create(
         &mut self,
         context: &MetalContext,
         specialization: GemvSpecialization,
@@ -399,9 +393,17 @@ impl GemvDispatch {
 
     /// Times the candidate tiles for one quantized decode shape and records
     /// the winner (policy override + on-disk cache). Runs once per shape per
-    /// device on the caller's live buffers, so the measured dispatches match
-    /// production exactly; the output buffer is scratch here — the caller's
-    /// real dispatch already produced its result.
+    /// device on the caller's live input buffers, so the measured dispatches
+    /// match production exactly.
+    ///
+    /// The output goes to a scratch buffer of its own, not to the caller's.
+    /// The caller's dispatch has only been *encoded* at this point -- its
+    /// command buffer is still open, while calibration submits and waits on
+    /// its own -- so writing there would be writing into a live destination.
+    /// A plain store would be overwritten by the real dispatch and hide it,
+    /// but `GemmDTransform::ACCUMULATE` makes the epilogue read-modify-write,
+    /// and the result would come out as the real value plus a hundred-odd
+    /// calibration products.
     #[allow(clippy::too_many_arguments)]
     fn calibrate<'b, TB: BufferArg<'b, Metal>>(
         &mut self,
@@ -427,9 +429,14 @@ impl GemvDispatch {
             results_per_simdgroup: base.results_per_simdgroup,
             packs: base.packs,
         };
+        let Ok(mut scratch_d) =
+            context.create_allocation(d.as_buffer_range_ref().range().len(), AllocationType::Global)
+        else {
+            return;
+        };
         let mut best: Option<(policy::GemvTile, std::time::Duration)> = None;
         for tile in autotune::candidates(base.group_size, base.bits, fitted) {
-            let rows = (tile.num_simdgroups / tile.k_split) * tile.results_per_simdgroup;
+            let rows = rows_per_threadgroup(tile.k_split, tile.results_per_simdgroup, tile.num_simdgroups);
             if n < tile.results_per_simdgroup || (has_rht && rows != 32) {
                 continue;
             }
@@ -454,6 +461,37 @@ impl GemvDispatch {
                 continue;
             }
             let pipeline = self.pipelines.get(&candidate).expect("pipeline just inserted");
+            // One untimed pass first. A pipeline's first execution pays for
+            // caches the later ones find warm, and the candidate list leads
+            // with the fitted tile, so without this the tile that happens to
+            // be measured first carries an advantage — enough to change the
+            // winner. Measured on gemma-3-1b-4bit's output projection, where a
+            // sweep on a cold machine picked SG2/R2 and the same sweep on a
+            // warm one picked SG8/R4, which is the faster of the two.
+            {
+                let Ok(mut warmup) = Encoder::<Metal>::new(context) else {
+                    break;
+                };
+                pipeline.encode(
+                    weights,
+                    Some(scales),
+                    zero_points,
+                    biases,
+                    a,
+                    &mut scratch_d,
+                    output_bias,
+                    rht_factors,
+                    None::<&Allocation<Metal>>,
+                    k,
+                    n,
+                    1,
+                    ab_scale,
+                    group_count_x,
+                    soft_cap,
+                    &mut warmup,
+                );
+                let _ = warmup.end_encoding().submit().wait_until_completed();
+            }
             for _ in 0..autotune::ITERATIONS_PER_CANDIDATE {
                 pipeline.encode(
                     weights,
@@ -461,7 +499,7 @@ impl GemvDispatch {
                     zero_points,
                     biases,
                     a,
-                    &mut *d,
+                    &mut scratch_d,
                     output_bias,
                     rht_factors,
                     None::<&Allocation<Metal>>,
@@ -488,3 +526,7 @@ impl GemvDispatch {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../../../../../tests/unit/backends/metal/kernel/matmul/gemv/instantiation_test.rs"]
+mod instantiation_test;

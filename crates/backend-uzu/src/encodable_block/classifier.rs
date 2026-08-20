@@ -73,6 +73,9 @@ impl<B: Backend> Classifier<B> {
             data_type,
             &config.transformer_config,
             &parameter_tree.subtree("transformer"),
+            // A classifier scores a prompt in one pass; there is no decode loop
+            // whose KV traffic could pay for compressing the cache.
+            false,
         )?;
 
         if config.classifier_pooling != PoolingType::Mean {

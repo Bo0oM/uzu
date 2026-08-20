@@ -58,6 +58,7 @@ impl<B: Backend> TransformerLayer<B> {
         layer_index: u32,
         parameter_tree: &ParameterTree<B>,
         data_type: DataType,
+        kv_int8: bool,
     ) -> Result<Self, TransformerLayerError<B>> {
         let post_layer_scalar = if layer_config.has_post_layer_scalar {
             if layer_config.post_mlp_norm_config.is_none() {
@@ -91,6 +92,7 @@ impl<B: Backend> TransformerLayer<B> {
             &layer_config.mixer_config,
             &parameter_tree.subtree("mixer"),
             context,
+            kv_int8,
         )?;
 
         let pre_mixer_norm = if let Some(pre_mixer_norm_config) = &layer_config.pre_mixer_norm_config {

@@ -73,9 +73,13 @@ PUBLIC KERNEL(DeltaNetUpdate)(
   const float decay = fast::exp(-fast::exp(float(a_log[hv_idx])) * sp);
 
   // Delta rule over the dv owned by this simd group. State is [Hv, Dv, Dk].
-  const uint dv_span = head_v_dim / dv_blocks;
+  // dv_blocks need not divide head_v_dim: rounding the span up and clamping
+  // the end keeps every dv owned by exactly one block, where truncating
+  // division would leave the tail unwritten.
+  const uint dv_span = (head_v_dim + dv_blocks - 1) / dv_blocks;
   const uint dv_base = dv_block_idx * dv_span;
-  for (uint dv = dv_base + sg; dv < dv_base + dv_span; dv += NUM_SG) {
+  const uint dv_end = min(dv_base + dv_span, head_v_dim);
+  for (uint dv = dv_base + sg; dv < dv_end; dv += NUM_SG) {
     const uint state_row = (hv_idx * head_v_dim + dv) * HEAD_K_DIM;
     const float v_i = float(in_proj[2 * key_dim + hv_idx * head_v_dim + dv]);
 

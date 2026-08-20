@@ -26,7 +26,10 @@ pub fn delta_net_update<T: ArrayElement + Float, const HEAD_K_DIM: u32>(
     value_dim: u32,
     dv_blocks: u32,
 ) {
-    debug_assert!(head_v_dim.is_multiple_of(dv_blocks), "head_v_dim must split evenly over dv_blocks");
+    // Splitting dv across threadgroups is a GPU concern: this reference walks
+    // the whole range in one pass, and the Metal kernel rounds the span up so
+    // the split need not divide head_v_dim.
+    let _ = dv_blocks;
     let state_ptr = state as *const T;
 
     let num_v_heads = num_v_heads as usize;

@@ -273,3 +273,37 @@ fn threaded_matmul_speedup() {
         single_elapsed.as_secs_f64() / threaded_elapsed.as_secs_f64()
     );
 }
+
+/// Measures what the per-dispatch activation buffer costs at prefill shapes:
+/// the decode-sized run allocates 16 KB per dispatch, the prefill-sized run
+/// allocates 22 MB, so the gap between their per-element times is the price of
+/// the allocation and its page faults.
+#[uzu_test]
+#[ignore]
+fn bench_matmul_activation_scratch() {
+    use test_runner::perf::run_perf_with_warmup;
+
+    let k = 4096u32;
+    let n = 4096u32;
+    let b = random_matrix((n * k) as usize, 0x2545F4914F6CDD1D);
+    for m in [1u32, 1357u32] {
+        let a = random_matrix((m * k) as usize, 0x9E3779B97F4A7C15);
+        let result = run_perf_with_warmup(&format!("cpu matmul m={m}"), 2, 5, || {
+            std::hint::black_box(run_matmul(8, m, n, k, &a, &b));
+        });
+        let elements = (m * k) as usize;
+        let allocation = run_perf_with_warmup(&format!("alloc m={m}"), 2, 20, || {
+            let mut scratch: Vec<f32> = Vec::with_capacity(elements);
+            for index in 0..elements {
+                scratch.push(index as f32);
+            }
+            std::hint::black_box(&scratch);
+        });
+        println!(
+            "m={m:5}: dispatch {:.2} ms | allocation+fill {:.2} ms ({:.2}% of dispatch)",
+            result.mean_ms,
+            allocation.mean_ms,
+            allocation.mean_ms / result.mean_ms * 100.0
+        );
+    }
+}

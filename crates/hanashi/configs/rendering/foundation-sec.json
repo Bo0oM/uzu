@@ -1,0 +1,51 @@
+{
+    "jinja": {
+        "template": "{{ bos_token }}\n{%- set has_system = messages[0]['role'] == 'system' -%}\n{%- if not has_system %}\n<|system|>\nYou are Metis, a cybersecurity reasoning model from the Minerva family developed by Foundation AI at Cisco. You specialize in security analysis, threat intelligence, and strategic reasoning in cybersecurity contexts. You were released in November 2025.\n\nThe user is a cybersecurity professional trying to accomplish some cybersecurity task. You must help them accomplish their tasks in the most efficient and safe manner possible. You must respond in a fashion that is direct, accurate, relevant, and helpful.\n\nYou have professional knowledge and experience of a senior-level cybersecurity specialist. For tasks relating to cyber threat intelligence (CTI), make sure that the identifiers are absolutely correct. The validity of the identifiers for common vulnerability enumerations (CVEs), common weakness enumerations (CWEs), other techniques, tactics, and procedures identifiers (TTPs), and advanced persistent threat classifications (APT) is of paramount importance.\n\nFor tasks relating to cloud security, it's important to be precise in the response as well. These questions will often ask you to consider, verify, or produce cloud configuration settings in various formats (such as JSON, Terraform, XML, etc.). Make sure these are absolutely correct before providing them to the user. Cite sources, especially from relevant cloud providers' documentation, and explain your logic thoroughly.\n\nIn the rare case when the user asks a harmful or unsafe question, especially pertaining to generating malware or ransomware, make sure to politely but firmly refuse. If the user asks questions not directly related to cybersecurity, you must also politely refuse the query and explain that you are only knowledgeable in cybersecurity.\n\n{%- endif %}\n{%- for message in messages %}\n  {%- if has_system and loop.index0 == 0 %}\n<|system|>\n{{ message['content'] }}\n\n  {%- elif message['role'] == 'user' %}\n<|user|>\n{{ message['content'] }}\n\n  {%- elif message['role'] == 'assistant' %}\n<|assistant|>\n    {%- if loop.last %}\n        {%- if message.content is not none %}\n{{ message.content.strip() }}\n        {%- endif %}\n    {%- else %}\n        {%- if message.content is not none %}\n            {%- set content = message.content.strip() %}\n            {%- if '</think>' in content %}\n                {%- set content_after_think = content.split('</think>')[-1].strip() %}\n{{ content_after_think }}\n            {%- else %}\n{{ content }}\n            {%- endif %}\n        {%- endif %}\n    {%- endif %}\n{{ eos_token }}\n\n  {%- endif %}\n{%- endfor %}\n\n{%- if add_generation_prompt %}\n<|assistant|>\n<think>\n{%- endif %}\n",
+        "required_functions": [],
+        "preamble_control_key": "add_generation_prompt",
+        "bos_token_key": "bos_token"
+    },
+    "canonization": {
+        "role_key": "role",
+        "type_key": "type",
+        "text_key": "text",
+        "url_key": "url"
+    },
+    "rendering": {
+        "system": {
+            "role": "system",
+            "message": {
+                "content": {
+                    "required": true,
+                    "blocks": [
+                        "text"
+                    ]
+                }
+            }
+        },
+        "user": {
+            "role": "user",
+            "message": {
+                "content": {
+                    "required": true,
+                    "blocks": [
+                        "text"
+                    ]
+                }
+            }
+        },
+        "assistant": {
+            "role": "assistant",
+            "message": {
+                "content": {
+                    "blocks": [
+                        "text"
+                    ]
+                },
+                "reasoning_content": {
+                    "block": "reasoning"
+                }
+            }
+        }
+    }
+}

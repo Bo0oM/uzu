@@ -32,6 +32,8 @@ pub enum HanashiConfig {
     },
     #[serde(rename = "functiongemma")]
     FunctionGemma,
+    #[serde(rename = "foundation-sec")]
+    FoundationSec,
     #[serde(rename = "gemma-3")]
     Gemma3,
     #[serde(rename = "gemma-4")]
@@ -106,6 +108,7 @@ impl HanashiConfig {
     pub fn resolve(&self) -> Result<HanashiResolvedConfig, Error> {
         match &self {
             HanashiConfig::FunctionGemma => resolve_bundled_config("functiongemma"),
+            HanashiConfig::FoundationSec => resolve_bundled_config("foundation-sec"),
             HanashiConfig::Gemma3 => resolve_bundled_config("gemma-3"),
             HanashiConfig::Gemma4 => resolve_bundled_config("gemma-4"),
             HanashiConfig::GptOss => resolve_bundled_config("gpt-oss"),
@@ -156,4 +159,42 @@ fn resolve_bundled_config(name: &str) -> Result<HanashiResolvedConfig, Error> {
         ordering: ordering_config,
     };
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every bundled template must parse against the current config schema:
+    /// a malformed file is otherwise only discovered when a model that uses
+    /// it is loaded.
+    #[test]
+    fn bundled_configs_resolve() {
+        for config in [
+            HanashiConfig::FunctionGemma,
+            HanashiConfig::FoundationSec,
+            HanashiConfig::Gemma3,
+            HanashiConfig::Gemma4,
+            HanashiConfig::GptOss,
+            HanashiConfig::Lfm2,
+            HanashiConfig::Lfm25Instruct,
+            HanashiConfig::Lfm25Thinking,
+            HanashiConfig::Llama32,
+            HanashiConfig::Qwen3,
+            HanashiConfig::Qwen3Instruct,
+            HanashiConfig::Qwen3Thinking,
+            HanashiConfig::Qwen35,
+            HanashiConfig::Qwen36,
+            HanashiConfig::MuseGlimmer,
+        ] {
+            config.resolve().unwrap_or_else(|error| panic!("{config:?} failed to resolve: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn foundation_sec_reports_reasoning_support() {
+        let capabilities = HanashiConfig::FoundationSec.capabilities().unwrap();
+        assert!(capabilities.supports_reasoning);
+        assert!(!capabilities.supports_tools);
+    }
 }

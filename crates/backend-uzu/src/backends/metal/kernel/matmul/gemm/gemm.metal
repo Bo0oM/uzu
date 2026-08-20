@@ -79,6 +79,18 @@ CONSTRAINT(
 CONSTRAINT((B_PROLOGUE == GemmBPrologueKind::FullPrecision) == (BITS == 0))
 CONSTRAINT((BITS == 0) == (GROUP_SIZE == 0))
 CONSTRAINT(B_PROLOGUE == GemmBPrologueKind::FullPrecision || BT != "float")
+// A quantized simdgroup GEMM cannot step over more of K at once than one
+// scale group covers, so a group of 16 leaves Tile64x64x16 as the only legal
+// tile. These two constraints pair them off in both directions: group 16 uses
+// that tile and nothing else, and that tile serves group 16 and nothing else.
+//
+// The second half is a deliberate limit on how many functions get compiled,
+// not an oversight -- it is why UZU_GEMM_TILE=64x64x16 fails on a 4-bit model
+// with group 64. Nothing is lost by it: a 16-wide K step is the narrowest
+// blocking on offer, and the tile sweep on 2026-08-18 had narrow blocking
+// losing badly at group 64 (Tile8x32x32 -57%, Tile32x32x32 -12% against
+// Tile64x64x32 on gemma-3-1b-4bit prefill). Widen this only with a measurement
+// that shows a 16-wide step winning somewhere.
 CONSTRAINT(
     GROUP_SIZE != 16 ||
     GEMM_TILING == GemmTiling::Tile64x64x16_Simdgroups2x2)

@@ -61,6 +61,7 @@ fn run_delta_net_update<B: Backend>(
     head_v_dim: u32,
     key_dim: u32,
     value_dim: u32,
+    dv_blocks: u32,
 ) -> (Vec<f32>, Vec<f32>) {
     let context = B::Context::new().expect("Failed to create context");
 
@@ -76,11 +77,6 @@ fn run_delta_net_update<B: Backend>(
         .expect("Failed to create kernel");
 
     let mut encoder = Encoder::new(context.as_ref()).expect("Failed to create encoder");
-    let dv_blocks = if head_v_dim.is_multiple_of(2) {
-        2
-    } else {
-        1
-    };
     kernel.encode(
         &in_proj_array,
         &a_log_array,
@@ -240,6 +236,7 @@ fn test_delta_net_update_impl(
     num_k_heads: usize,
     head_k_dim: usize,
     head_v_dim: usize,
+    dv_blocks: u32,
     label: &str,
 ) {
     let key_dim = num_k_heads * head_k_dim;
@@ -266,6 +263,7 @@ fn test_delta_net_update_impl(
         head_v_dim as u32,
         key_dim as u32,
         value_dim as u32,
+        dv_blocks,
     );
     let (gpu_out, gpu_state) = run_delta_net_update::<Metal>(
         &in_proj,
@@ -279,6 +277,7 @@ fn test_delta_net_update_impl(
         head_v_dim as u32,
         key_dim as u32,
         value_dim as u32,
+        dv_blocks,
     );
 
     assert_close(&cpu_out, &gpu_out, 1e-3, 1e-2, &format!("{label} output"));
@@ -287,7 +286,17 @@ fn test_delta_net_update_impl(
 
 #[uzu_test]
 fn test_delta_net_update_qwen35_shapes() {
-    test_delta_net_update_impl(48, 16, 128, 128, "DeltaNetUpdate Qwen3.5");
+    test_delta_net_update_impl(48, 16, 128, 128, 4, "DeltaNetUpdate Qwen3.5");
+}
+
+/// The dv range is split across threadgroups; a block count that does not
+/// divide it used to leave the trailing dv unwritten, which reads as plausible
+/// output because the rest of the head is correct.
+#[uzu_test]
+fn test_delta_net_update_dv_blocks_with_remainder() {
+    for dv_blocks in [3, 5, 7, 24] {
+        test_delta_net_update_impl(4, 2, 128, 100, dv_blocks, &format!("DeltaNetUpdate dv_blocks={dv_blocks}"));
+    }
 }
 
 // DeltaNetPrefill + NormGate
@@ -446,6 +455,7 @@ fn test_prefill_norm_gate_impl<T: ArrayElement>(
             head_v_dim as u32,
             key_dim as u32,
             value_dim as u32,
+            1,
         );
         ref_state = new_state;
         // The update kernel now returns raw outputs; apply the NormGate math

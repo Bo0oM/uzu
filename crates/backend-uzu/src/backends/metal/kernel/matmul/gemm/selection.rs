@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use thiserror::Error;
 
 use super::{GemmEngine, GemmPlan, policy};
@@ -157,10 +159,52 @@ fn mxu_is_eligible(shape: MatmulShape) -> bool {
         && shape.k.is_multiple_of(select_mxu_quant_tiling(shape).block_k())
 }
 
+/// Forces one tile for every GEMM, so the hand-written policy in `policy.rs`
+/// can be measured against the alternatives it never tries. A tile built for
+/// the other engine is ignored rather than rejected: the override is a probe,
+/// and half a run is worse than no run. Names are the block dims, e.g.
+/// `UZU_GEMM_TILE=64x64x32`.
+static TILE_OVERRIDE: LazyLock<Option<GemmTiling>> = LazyLock::new(|| {
+    let name = std::env::var("UZU_GEMM_TILE").ok()?;
+    let tiling = match name.as_str() {
+        "8x32x32" => GemmTiling::Tile8x32x32_Simdgroups1x1,
+        "64x32x32" => GemmTiling::Tile64x32x32_Simdgroups2x2,
+        "64x64x16" => GemmTiling::Tile64x64x16_Simdgroups2x2,
+        "64x64x32" => GemmTiling::Tile64x64x32_Simdgroups2x2,
+        "32x32x32" => GemmTiling::Tile32x32x32_Simdgroups2x2,
+        // Not every name here is instantiated for every shape: the quantized
+        // simdgroup variants are compiled only where the tile's K step fits
+        // the scale group, so 64x64x16 exists for group 16 alone. An override
+        // that misses fails loudly at pipeline creation rather than quietly
+        // running something else, which is what a probe should do.
+        "16x32x256" => GemmTiling::Tile16x32x256_Simdgroups1x1,
+        "16x128x256" => GemmTiling::Tile16x128x256_Simdgroups1x4,
+        "32x64x256" => GemmTiling::Tile32x64x256_Simdgroups2x2,
+        "64x32x256" => GemmTiling::Tile64x32x256_Simdgroups4x1,
+        "64x64x256" => GemmTiling::Tile64x64x256_Simdgroups2x2,
+        "128x128x256" => GemmTiling::Tile128x128x256_Simdgroups4x4,
+        other => {
+            eprintln!("UZU_GEMM_TILE: unknown tile {other}, keeping the policy choice");
+            return None;
+        },
+    };
+    Some(tiling)
+});
+
 fn select_tiling(
     shape: MatmulShape,
     engine: GemmEngine,
 ) -> GemmTiling {
+    if let Some(tiling) = *TILE_OVERRIDE {
+        // A quantized simdgroup GEMM cannot step over more of K than one scale
+        // group covers, so a tile that would break that stays unused.
+        let fits_engine = tiling.is_mxu_variant() == (engine == GemmEngine::Mxu);
+        let fits_groups = engine == GemmEngine::Mxu
+            || shape.b_group_size.is_none_or(|group_size| tiling.simdgroup_block_k() <= group_size);
+        if fits_engine && fits_groups {
+            return tiling;
+        }
+    }
     match engine {
         GemmEngine::Simdgroup if shape.is_quant() => {
             policy::simdgroup_quant_tile(shape.m, shape.n, shape.b_group_size.unwrap_or(0))

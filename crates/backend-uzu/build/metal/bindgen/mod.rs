@@ -126,7 +126,32 @@ pub fn bindgen(
     Ok((kernel_tokens, trait_wiring.associated_type))
 }
 
+/// A fingerprint of the compiled shaders, for anything that caches a decision
+/// measured against them.
+///
+/// The first-launch tile calibration is the case: its cache was keyed on the
+/// package version, which does not move between builds of a development
+/// branch, so it kept serving winners measured against kernels that had since
+/// been rewritten — 7.5% of gemma-3-1b-4bit decode, silently, because a stale
+/// tile is still a valid one. Hashing the linked libraries makes the key
+/// follow the thing the measurement depends on.
+fn shader_fingerprint(paths: &[std::path::PathBuf]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for path in paths {
+        // Whichever form the build produced; both are the compiled library.
+        for extension in ["metallib", "metallib.zst"] {
+            if let Ok(contents) = std::fs::read(path.with_extension(extension)) {
+                hasher.update(&contents);
+            }
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 pub fn bindgen_global(kernels: &[(impl AsRef<std::path::Path>, &[Kernel])]) -> Result<TokenStream> {
+    let fingerprint =
+        shader_fingerprint(&kernels.iter().map(|(path, _)| path.as_ref().to_path_buf()).collect::<Vec<_>>());
+
     let includes = kernels.iter().map(|(path, _kernels)| {
         let path = path.as_ref().to_str().expect("bindings path is not utf-8");
 
@@ -145,6 +170,9 @@ pub fn bindgen_global(kernels: &[(impl AsRef<std::path::Path>, &[Kernel])]) -> R
     });
 
     let tokens = quote! {
+        /// Hash of the linked Metal libraries; see `shader_fingerprint`.
+        pub const METAL_SHADER_FINGERPRINT: &str = #fingerprint;
+
         use metal::{MTLComputeCommandEncoder, MTLComputePipelineState, MTLFunctionConstantValues, MTLSize};
         use objc2::{rc::Retained, runtime::ProtocolObject};
 
